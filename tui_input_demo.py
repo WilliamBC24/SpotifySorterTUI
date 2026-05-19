@@ -28,20 +28,21 @@ def run(stdscr: curses.window) -> None:
         stdscr.erase()
         rows, cols = stdscr.getmaxyx()
 
-        title = "SpotifySorterTUI - Input Demo"
+        title = "Spotify Sorter TUI - Input Demo"
         help_text = "Press arrow keys or Enter. Press q to quit."
+        width = max(1, cols - 1)
 
-        stdscr.addnstr(0, 0, title, cols - 1)
-        stdscr.addnstr(1, 0, help_text, cols - 1)
-        stdscr.hline(2, 0, "-", max(1, cols - 1))
-        stdscr.addnstr(3, 0, "Captured input:", cols - 1)
+        stdscr.addnstr(0, 0, title, width)
+        stdscr.addnstr(1, 0, help_text, width)
+        stdscr.hline(2, 0, "-", width)
+        stdscr.addnstr(3, 0, "Captured input:", width)
 
         available_lines = max(1, rows - 5)
         visible_history = history[-available_lines:]
         start_number = len(history) - len(visible_history) + 1
         for row_offset, item in enumerate(visible_history):
             event_number = start_number + row_offset
-            stdscr.addnstr(4 + row_offset, 0, f"{event_number}. {item}", cols - 1)
+            stdscr.addnstr(4 + row_offset, 0, f"{event_number}. {item}", width)
 
         stdscr.refresh()
 

@@ -42,10 +42,7 @@ def _base64_url_encode(data: bytes) -> str:
 
 
 def _build_pkce_pair() -> tuple[str, str]:
-    code_verifier = secrets.token_urlsafe(64)
-    if len(code_verifier) < 43:
-        code_verifier += secrets.token_urlsafe(32)
-    code_verifier = code_verifier[:128]
+    code_verifier = secrets.token_urlsafe(96)[:128]
     challenge_raw = hashlib.sha256(code_verifier.encode("utf-8")).digest()
     code_challenge = _base64_url_encode(challenge_raw)
     return code_verifier, code_challenge
@@ -193,8 +190,7 @@ def _spotify_request_json(
             if exc.code == 429 and attempt < max_retries:
                 retry_after_header = exc.headers.get("Retry-After", "").strip()
                 try:
-                    retry_after = max(0.0, float(retry_after_header))
-                    sleep_seconds = retry_after
+                    sleep_seconds = max(0.0, float(retry_after_header))
                 except ValueError:
                     sleep_seconds = backoff_seconds
                 time.sleep(sleep_seconds)
@@ -255,7 +251,16 @@ def _refresh_access_token(client_id: str, refresh_token: str) -> dict[str, objec
 
 def _get_access_token(client_id: str, token_cache: dict[str, object]) -> str:
     access_token = token_cache.get("access_token")
-    expires_at = float(token_cache.get("expires_at", 0))
+    raw_expires_at = token_cache.get("expires_at", 0)
+    if isinstance(raw_expires_at, (float, int)):
+        expires_at = float(raw_expires_at)
+    elif isinstance(raw_expires_at, str):
+        try:
+            expires_at = float(raw_expires_at)
+        except ValueError:
+            expires_at = 0.0
+    else:
+        expires_at = 0.0
     if isinstance(access_token, str) and access_token and time.time() < expires_at:
         return access_token
 
@@ -370,7 +375,13 @@ def run(stdscr: curses.window) -> None:
             history.append("Connecting to Spotify...")
             try:
                 history.extend(connect_and_get_playlist_lines())
-            except (RuntimeError, TimeoutError, urllib.error.URLError) as exc:
+            except (
+                RuntimeError,
+                TimeoutError,
+                urllib.error.URLError,
+                json.JSONDecodeError,
+                UnicodeDecodeError,
+            ) as exc:
                 history.append(f"Connection failed: {exc}")
             continue
 

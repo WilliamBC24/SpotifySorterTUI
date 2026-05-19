@@ -41,7 +41,7 @@ def _base64_url_encode(data: bytes) -> str:
 
 
 def _build_pkce_pair() -> tuple[str, str]:
-    code_verifier = secrets.token_urlsafe(64)[:128]
+    code_verifier = secrets.token_urlsafe(64)
     challenge_raw = hashlib.sha256(code_verifier.encode("utf-8")).digest()
     code_challenge = _base64_url_encode(challenge_raw)
     return code_verifier, code_challenge
@@ -101,7 +101,7 @@ def _wait_for_auth_code(redirect_uri: str, expected_state: str, timeout_seconds:
             )
             done.set()
 
-        def log_message(self, format: str, *args: object) -> None:
+        def log_message(self, fmt: str, *args: object) -> None:
             return
 
     server = HTTPServer((parsed.hostname, parsed.port), CallbackHandler)
@@ -146,6 +146,17 @@ def _read_error_message(error_body: bytes, status_code: int) -> str:
             if nested_error.strip():
                 return nested_error.strip()
     return default_message
+
+
+def _safe_int(value: object, default: int) -> int:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return default
+    return default
 
 
 def _spotify_request_json(
@@ -208,7 +219,7 @@ def _exchange_code_for_token(
     access_token = payload.get("access_token")
     if not access_token:
         raise RuntimeError("No access token received from Spotify.")
-    expires_in = int(payload.get("expires_in", 3600))
+    expires_in = _safe_int(payload.get("expires_in", 3600), 3600)
     return {
         "access_token": access_token,
         "refresh_token": payload.get("refresh_token"),
@@ -229,7 +240,7 @@ def _refresh_access_token(client_id: str, refresh_token: str) -> dict[str, objec
     access_token = payload.get("access_token")
     if not access_token:
         raise RuntimeError("Spotify refresh response did not include an access token.")
-    expires_in = int(payload.get("expires_in", 3600))
+    expires_in = _safe_int(payload.get("expires_in", 3600), 3600)
     return {
         "access_token": access_token,
         "refresh_token": payload.get("refresh_token", refresh_token),
@@ -265,7 +276,8 @@ def _fetch_user_playlists(client_id: str, tokens: dict[str, object]) -> list[tup
         for item in payload.get("items", []):
             if not isinstance(item, dict):
                 continue
-            name = str(item.get("name", "Unnamed Playlist"))
+            raw_name = item.get("name")
+            name = raw_name if isinstance(raw_name, str) and raw_name else "Unnamed Playlist"
             tracks = item.get("tracks", {})
             track_total = 0
             if isinstance(tracks, dict):

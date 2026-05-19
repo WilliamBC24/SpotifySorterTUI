@@ -389,6 +389,7 @@ def run(stdscr: curses.window) -> None:
     connection_lock = threading.Lock()
     connection_status = "idle"
     connection_messages: list[str] = []
+    connection_thread: threading.Thread | None = None
 
     def connect_worker() -> None:
         nonlocal connection_status, connection_messages
@@ -436,19 +437,22 @@ def run(stdscr: curses.window) -> None:
         stdscr.refresh()
 
         key = stdscr.getch()
+        if key == -1:
+            continue
         if key in (ord("q"), ord("Q")):
             break
         if key in (ord("c"), ord("C")):
+            nonlocal_thread: threading.Thread | None = None
             with connection_lock:
                 if connection_status == "running":
                     history.append("Connection already in progress...")
                 else:
                     history.append("Connecting to Spotify...")
                     connection_status = "running"
-                    threading.Thread(target=connect_worker, daemon=True).start()
-            continue
-
-        if key == -1:
+                    nonlocal_thread = threading.Thread(target=connect_worker, daemon=True)
+                    connection_thread = nonlocal_thread
+            if nonlocal_thread is not None:
+                nonlocal_thread.start()
             continue
         label = KEY_LABELS.get(key, f"KEYCODE {key}")
         history.append(label)

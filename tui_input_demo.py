@@ -76,7 +76,7 @@ def _wait_for_auth_code(redirect_uri: str, expected_state: str, timeout_seconds:
     done = threading.Event()
 
     class CallbackHandler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:  # noqa: N802
+        def do_GET(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
             request_url = urllib.parse.urlparse(self.path)
             if request_url.path != parsed.path:
                 self.send_response(404)
@@ -224,7 +224,7 @@ def _exchange_code_for_token(
     access_token = payload.get("access_token")
     if not access_token:
         raise RuntimeError("No access token received from Spotify.")
-    expires_in = _safe_int(payload.get("expires_in", DEFAULT_TOKEN_EXPIRY_SECONDS), DEFAULT_TOKEN_EXPIRY_SECONDS)
+    expires_in = _safe_int(payload.get("expires_in"), DEFAULT_TOKEN_EXPIRY_SECONDS)
     return {
         "access_token": access_token,
         "refresh_token": payload.get("refresh_token"),
@@ -245,7 +245,7 @@ def _refresh_access_token(client_id: str, refresh_token: str) -> dict[str, objec
     access_token = payload.get("access_token")
     if not access_token:
         raise RuntimeError("Spotify refresh response did not include an access token.")
-    expires_in = _safe_int(payload.get("expires_in", DEFAULT_TOKEN_EXPIRY_SECONDS), DEFAULT_TOKEN_EXPIRY_SECONDS)
+    expires_in = _safe_int(payload.get("expires_in"), DEFAULT_TOKEN_EXPIRY_SECONDS)
     return {
         "access_token": access_token,
         "refresh_token": payload.get("refresh_token", refresh_token),

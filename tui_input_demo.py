@@ -10,6 +10,8 @@ import hashlib
 import json
 import os
 import secrets
+import shutil
+import subprocess
 import threading
 import time
 import urllib.error
@@ -51,6 +53,31 @@ def _build_pkce_pair() -> tuple[str, str]:
     challenge_raw = hashlib.sha256(code_verifier.encode("utf-8")).digest()
     code_challenge = _base64_url_encode(challenge_raw)
     return code_verifier, code_challenge
+
+
+def _open_authorization_page(auth_url: str) -> None:
+    xdg_open = shutil.which("xdg-open")
+    if xdg_open:
+        try:
+            subprocess.Popen(
+                [xdg_open, auth_url],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                start_new_session=True,
+            )
+            return
+        except OSError:
+            pass
+
+    if webbrowser.open(auth_url, new=1, autoraise=True):
+        return
+
+    raise RuntimeError(
+        "Unable to open a browser automatically. "
+        f"Open this URL manually to continue: {auth_url}"
+    )
 
 
 def _validate_redirect_uri(redirect_uri: str) -> urllib.parse.ParseResult:
@@ -338,7 +365,7 @@ def connect_and_get_playlist_lines() -> list[str]:
     )
     auth_url = f"{SPOTIFY_AUTH_URL}?{auth_query}"
 
-    webbrowser.open(auth_url)
+    _open_authorization_page(auth_url)
     code = _wait_for_auth_code(redirect_uri, state)
     tokens = _exchange_code_for_token(client_id, redirect_uri, code, code_verifier)
     playlists = _fetch_user_playlists(client_id, tokens)
@@ -355,12 +382,38 @@ def connect_and_get_playlist_lines() -> list[str]:
 
 def run(stdscr: curses.window) -> None:
     curses.curs_set(0)
-    stdscr.nodelay(False)
+    stdscr.timeout(100)
     stdscr.keypad(True)
 
     history: list[str] = ["Press c to connect to Spotify with PKCE."]
+    connection_lock = threading.Lock()
+    connection_status = "idle"
+    connection_messages: list[str] = []
+
+    def connect_worker() -> None:
+        nonlocal connection_status, connection_messages
+        messages: list[str]
+        try:
+            messages = connect_and_get_playlist_lines()
+        except (
+            RuntimeError,
+            TimeoutError,
+            urllib.error.URLError,
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+        ) as exc:
+            messages = [f"Connection failed: {exc}"]
+        with connection_lock:
+            connection_messages = messages
+            connection_status = "done"
 
     while True:
+        with connection_lock:
+            if connection_status == "done":
+                history.extend(connection_messages)
+                connection_messages = []
+                connection_status = "idle"
+
         stdscr.erase()
         rows, cols = stdscr.getmaxyx()
 
@@ -386,19 +439,17 @@ def run(stdscr: curses.window) -> None:
         if key in (ord("q"), ord("Q")):
             break
         if key in (ord("c"), ord("C")):
-            history.append("Connecting to Spotify...")
-            try:
-                history.extend(connect_and_get_playlist_lines())
-            except (
-                RuntimeError,
-                TimeoutError,
-                urllib.error.URLError,
-                json.JSONDecodeError,
-                UnicodeDecodeError,
-            ) as exc:
-                history.append(f"Connection failed: {exc}")
+            with connection_lock:
+                if connection_status == "running":
+                    history.append("Connection already in progress...")
+                else:
+                    history.append("Connecting to Spotify...")
+                    connection_status = "running"
+                    threading.Thread(target=connect_worker, daemon=True).start()
             continue
 
+        if key == -1:
+            continue
         label = KEY_LABELS.get(key, f"KEYCODE {key}")
         history.append(label)
 

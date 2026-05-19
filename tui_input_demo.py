@@ -403,7 +403,9 @@ def run(stdscr: curses.window) -> None:
                 error_message = ""
                 connection_status = "idle"
                 if playlists:
-                    status_message = f"Fetched {len(playlists)} playlist(s). Use ↑/↓ to navigate."
+                    status_message = (
+                        f"Fetched {len(playlists)} playlist(s). Use up/down arrow keys to navigate."
+                    )
                 else:
                     status_message = "Connected. No playlists found for this user."
         except (

@@ -41,7 +41,7 @@ def _base64_url_encode(data: bytes) -> str:
 
 
 def _build_pkce_pair() -> tuple[str, str]:
-    code_verifier = secrets.token_urlsafe(64)
+    code_verifier = secrets.token_urlsafe(96)[:128]
     challenge_raw = hashlib.sha256(code_verifier.encode("utf-8")).digest()
     code_challenge = _base64_url_encode(challenge_raw)
     return code_verifier, code_challenge
@@ -102,7 +102,7 @@ def _wait_for_auth_code(redirect_uri: str, expected_state: str, timeout_seconds:
             done.set()
 
         def log_message(self, fmt: str, *args: object) -> None:
-            return
+            pass
 
     server = HTTPServer((parsed.hostname, parsed.port), CallbackHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -190,9 +190,10 @@ def _spotify_request_json(
                 retry_after_header = exc.headers.get("Retry-After", "").strip()
                 try:
                     retry_after = max(0.0, float(retry_after_header))
+                    sleep_seconds = retry_after
                 except ValueError:
-                    retry_after = backoff_seconds
-                time.sleep(max(retry_after, backoff_seconds))
+                    sleep_seconds = backoff_seconds
+                time.sleep(sleep_seconds)
                 backoff_seconds *= 2.0
                 continue
             raise RuntimeError(f"Spotify API error {exc.code}: {error_message}") from exc
@@ -248,26 +249,26 @@ def _refresh_access_token(client_id: str, refresh_token: str) -> dict[str, objec
     }
 
 
-def _get_access_token(client_id: str, tokens: dict[str, object]) -> str:
-    access_token = tokens.get("access_token")
-    expires_at = float(tokens.get("expires_at", 0))
+def _get_access_token(client_id: str, token_cache: dict[str, object]) -> str:
+    access_token = token_cache.get("access_token")
+    expires_at = float(token_cache.get("expires_at", 0))
     if isinstance(access_token, str) and access_token and time.time() < expires_at:
         return access_token
 
-    refresh_token = tokens.get("refresh_token")
+    refresh_token = token_cache.get("refresh_token")
     if not isinstance(refresh_token, str) or not refresh_token:
         raise RuntimeError("Access token expired and no refresh token is available.")
     refreshed = _refresh_access_token(client_id, refresh_token)
-    tokens.update(refreshed)
-    return str(tokens["access_token"])
+    token_cache.update(refreshed)
+    return str(token_cache["access_token"])
 
 
-def _fetch_user_playlists(client_id: str, tokens: dict[str, object]) -> list[tuple[str, int]]:
+def _fetch_user_playlists(client_id: str, token_cache: dict[str, object]) -> list[tuple[str, int]]:
     playlists: list[tuple[str, int]] = []
     next_url = f"{SPOTIFY_PLAYLISTS_URL}?limit=50"
 
     while next_url:
-        access_token = _get_access_token(client_id, tokens)
+        access_token = _get_access_token(client_id, token_cache)
         payload = _spotify_request_json(
             next_url,
             headers={"Authorization": f"Bearer {access_token}"},
@@ -325,7 +326,7 @@ def connect_and_get_playlist_lines() -> list[str]:
         return lines
 
     for name, track_total in playlists:
-        lines.append(f"- {name} ({track_total} songs)")
+        lines.append(f"- {name} ({track_total} tracks)")
     return lines
 
 

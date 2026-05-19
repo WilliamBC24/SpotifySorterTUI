@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
-import curses
 import base64
+import curses
 import datetime
 import hashlib
 import json
@@ -18,18 +18,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, HTTPServer
-
-
-KEY_LABELS = {
-    curses.KEY_UP: "UP",
-    curses.KEY_DOWN: "DOWN",
-    curses.KEY_LEFT: "LEFT",
-    curses.KEY_RIGHT: "RIGHT",
-    curses.KEY_ENTER: "ENTER",
-    10: "ENTER",
-    13: "ENTER",
-}
 
 
 SPOTIFY_AUTH_URL = "https://accounts.spotify.com/authorize"
@@ -348,7 +338,9 @@ def _fetch_user_playlists(client_id: str, token_cache: dict[str, object]) -> lis
     return playlists
 
 
-def connect_and_get_playlist_lines() -> list[str]:
+def connect_and_get_playlists(
+    status_callback: Callable[[str], None] | None = None,
+) -> list[tuple[str, int]]:
     client_id = os.getenv("SPOTIFY_CLIENT_ID", "").strip()
     redirect_uri = os.getenv("SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8888/callback").strip()
     if not client_id:
@@ -370,19 +362,17 @@ def connect_and_get_playlist_lines() -> list[str]:
     )
     auth_url = f"{SPOTIFY_AUTH_URL}?{auth_query}"
 
+    if status_callback is not None:
+        status_callback("Opening Spotify authorization in browser...")
     _open_authorization_page(auth_url)
+    if status_callback is not None:
+        status_callback("Waiting for Spotify login approval in browser...")
     code = _wait_for_auth_code(redirect_uri, state)
+    if status_callback is not None:
+        status_callback("Authorization approved. Fetching playlists from Spotify...")
     tokens = _exchange_code_for_token(client_id, redirect_uri, code, code_verifier)
     playlists = _fetch_user_playlists(client_id, tokens)
-
-    lines = ["Playlist data provided by Spotify.", f"Fetched {len(playlists)} playlist(s):"]
-    if not playlists:
-        lines.append("No playlists found for this user.")
-        return lines
-
-    for name, track_total in playlists:
-        lines.append(f"- {name} ({track_total} tracks)")
-    return lines
+    return playlists
 
 
 def run(stdscr: curses.window) -> None:
@@ -390,16 +380,34 @@ def run(stdscr: curses.window) -> None:
     stdscr.timeout(UI_POLL_INTERVAL_MS)
     stdscr.keypad(True)
 
-    history: list[str] = ["Press c to connect to Spotify with PKCE."]
     connection_lock = threading.Lock()
     connection_status = "idle"
-    connection_messages: list[str] = []
+    status_message = "Press c to connect to Spotify with PKCE."
+    error_message = ""
+    playlists: list[tuple[str, int]] = []
+    selected_index = 0
+    scroll_offset = 0
 
     def connect_worker() -> None:
-        nonlocal connection_status, connection_messages
-        messages: list[str] = []
+        nonlocal connection_status, status_message, error_message, playlists, selected_index, scroll_offset
+
+        def update_status(message: str) -> None:
+            nonlocal status_message
+            with connection_lock:
+                status_message = message
+
         try:
-            messages = connect_and_get_playlist_lines()
+            fetched_playlists = connect_and_get_playlists(status_callback=update_status)
+            with connection_lock:
+                playlists = fetched_playlists
+                selected_index = 0
+                scroll_offset = 0
+                error_message = ""
+                connection_status = "idle"
+                if playlists:
+                    status_message = f"Fetched {len(playlists)} playlist(s). Use ↑/↓ to navigate."
+                else:
+                    status_message = "Connected. No playlists found for this user."
         except (
             RuntimeError,
             TimeoutError,
@@ -407,36 +415,52 @@ def run(stdscr: curses.window) -> None:
             json.JSONDecodeError,
             UnicodeDecodeError,
         ) as exc:
-            messages = [f"Connection failed: {exc}"]
-        with connection_lock:
-            connection_messages = messages
-            connection_status = "done"
+            with connection_lock:
+                connection_status = "idle"
+                error_message = f"Connection failed: {exc}"
+                status_message = "Press c to retry Spotify connection."
 
     while True:
         with connection_lock:
-            if connection_status == "done":
-                history.extend(connection_messages)
-                connection_messages = []
-                connection_status = "idle"
+            status_snapshot = status_message
+            error_snapshot = error_message
+            playlists_snapshot = list(playlists)
+            selected_snapshot = selected_index
+            status_flag = connection_status
 
         stdscr.erase()
         rows, cols = stdscr.getmaxyx()
 
-        title = "Spotify Playlist Viewer TUI - Spotify Connection"
-        help_text = "Press c to connect. Press q to quit."
+        title = "Spotify Playlist Viewer TUI"
+        help_text = "c: connect/reload  ↑/↓: move selection  q: quit"
         width = max(1, cols - 1)
 
         stdscr.addnstr(0, 0, title, width)
         stdscr.addnstr(1, 0, help_text, width)
         stdscr.hline(2, 0, "-", width)
-        stdscr.addnstr(3, 0, "Captured input:", width)
+        stdscr.addnstr(3, 0, status_snapshot, width)
+        if error_snapshot:
+            stdscr.addnstr(4, 0, error_snapshot, width)
 
-        available_lines = max(1, rows - 5)
-        visible_history = history[-available_lines:]
-        start_number = len(history) - len(visible_history) + 1
-        for row_offset, item in enumerate(visible_history):
-            event_number = start_number + row_offset
-            stdscr.addnstr(4 + row_offset, 0, f"{event_number}. {item}", width)
+        list_header_row = 5 if error_snapshot else 4
+        stdscr.addnstr(list_header_row, 0, "Playlists:", width)
+
+        if not playlists_snapshot:
+            stdscr.addnstr(list_header_row + 1, 0, "No playlists loaded yet.", width)
+        else:
+            max_visible = max(1, rows - (list_header_row + 2))
+            selected_snapshot = max(0, min(selected_snapshot, len(playlists_snapshot) - 1))
+            if selected_snapshot < scroll_offset:
+                scroll_offset = selected_snapshot
+            elif selected_snapshot >= scroll_offset + max_visible:
+                scroll_offset = selected_snapshot - max_visible + 1
+
+            visible = playlists_snapshot[scroll_offset : scroll_offset + max_visible]
+            for row_offset, (name, track_total) in enumerate(visible):
+                playlist_index = scroll_offset + row_offset
+                line = f"{playlist_index + 1}. {name} ({track_total} tracks)"
+                attr = curses.A_REVERSE if playlist_index == selected_snapshot else curses.A_NORMAL
+                stdscr.addnstr(list_header_row + 1 + row_offset, 0, line, width, attr)
 
         stdscr.refresh()
 
@@ -449,16 +473,24 @@ def run(stdscr: curses.window) -> None:
             should_start_connection = False
             with connection_lock:
                 if connection_status == "running":
-                    history.append("Connection already in progress...")
+                    status_message = "Connection already in progress..."
                 else:
-                    history.append("Connecting to Spotify...")
+                    status_message = "Connecting to Spotify..."
+                    error_message = ""
                     connection_status = "running"
                     should_start_connection = True
             if should_start_connection:
                 threading.Thread(target=connect_worker, daemon=True).start()
             continue
-        label = KEY_LABELS.get(key, f"KEYCODE {key}")
-        history.append(label)
+        if key == curses.KEY_UP:
+            with connection_lock:
+                if playlists:
+                    selected_index = max(0, selected_index - 1)
+            continue
+        if key == curses.KEY_DOWN:
+            with connection_lock:
+                if playlists:
+                    selected_index = min(len(playlists) - 1, selected_index + 1)
 
 
 def main() -> None:

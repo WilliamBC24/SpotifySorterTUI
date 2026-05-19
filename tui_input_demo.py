@@ -362,18 +362,17 @@ def _fetch_user_playlists(
         offsets = list(range(PLAYLIST_PAGE_LIMIT, total_playlists, PLAYLIST_PAGE_LIMIT))
         total_pages = len(offsets) + 1
         worker_count = min(MAX_PLAYLIST_FETCH_WORKERS, len(offsets))
-        if worker_count > 0:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
-                futures = [executor.submit(fetch_page, offset) for offset in offsets]
-                completed = 1
-                for future in concurrent.futures.as_completed(futures):
-                    offset, payload = future.result()
-                    page_payloads[offset] = payload
-                    completed += 1
-                    if status_callback is not None:
-                        status_callback(
-                            f"Fetching playlists from Spotify ({completed}/{total_pages} pages)..."
-                        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [executor.submit(fetch_page, offset) for offset in offsets]
+            completed = 1
+            for future in concurrent.futures.as_completed(futures):
+                offset, payload = future.result()
+                page_payloads[offset] = payload
+                completed += 1
+                if status_callback is not None:
+                    status_callback(
+                        f"Fetching playlists from Spotify ({completed}/{total_pages} pages)..."
+                    )
     else:
         next_url = first_page.get("next")
         page_index = 1

@@ -343,13 +343,16 @@ def _fetch_user_playlists(
 
     token_lock = threading.Lock()
 
-    def fetch_page(offset: int) -> tuple[int, dict[str, object]]:
+    def fetch_url(url: str) -> dict[str, object]:
         with token_lock:
             access_token = _get_access_token(client_id, token_cache)
-        payload = _spotify_request_json(
-            build_page_url(offset),
+        return _spotify_request_json(
+            url,
             headers={"Authorization": f"Bearer {access_token}"},
         )
+
+    def fetch_page(offset: int) -> tuple[int, dict[str, object]]:
+        payload = fetch_url(build_page_url(offset))
         return offset, payload
 
     if status_callback is not None:
@@ -361,18 +364,27 @@ def _fetch_user_playlists(
     if total_playlists > PLAYLIST_PAGE_LIMIT:
         offsets = list(range(PLAYLIST_PAGE_LIMIT, total_playlists, PLAYLIST_PAGE_LIMIT))
         total_pages = len(offsets) + 1
-        worker_count = min(MAX_PLAYLIST_FETCH_WORKERS, len(offsets))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
-            futures = [executor.submit(fetch_page, offset) for offset in offsets]
-            completed = 1
-            for future in concurrent.futures.as_completed(futures):
-                offset, payload = future.result()
+        if len(offsets) <= 2:
+            for index, offset in enumerate(offsets, start=2):
+                _, payload = fetch_page(offset)
                 page_payloads[offset] = payload
-                completed += 1
                 if status_callback is not None:
                     status_callback(
-                        f"Fetching playlists from Spotify ({completed}/{total_pages} pages)..."
+                        f"Fetching playlists from Spotify ({index}/{total_pages} pages)..."
                     )
+        else:
+            worker_count = min(MAX_PLAYLIST_FETCH_WORKERS, len(offsets))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+                futures = [executor.submit(fetch_page, offset) for offset in offsets]
+                completed = 1
+                for future in concurrent.futures.as_completed(futures):
+                    offset, payload = future.result()
+                    page_payloads[offset] = payload
+                    completed += 1
+                    if status_callback is not None:
+                        status_callback(
+                            f"Fetching playlists from Spotify ({completed}/{total_pages} pages)..."
+                        )
     else:
         next_url = first_page.get("next")
         page_index = 1
@@ -381,12 +393,7 @@ def _fetch_user_playlists(
             page_index += 1
             if status_callback is not None:
                 status_callback(f"Fetching playlists from Spotify (page {page_index})...")
-            with token_lock:
-                access_token = _get_access_token(client_id, token_cache)
-            payload = _spotify_request_json(
-                next_url,
-                headers={"Authorization": f"Bearer {access_token}"},
-            )
+            payload = fetch_url(next_url)
             page_payloads[next_offset] = payload
             next_offset += PLAYLIST_PAGE_LIMIT
             next_url = payload.get("next")

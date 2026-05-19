@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
-import base64
 import curses
+import base64
 import datetime
 import hashlib
 import json
@@ -425,7 +425,6 @@ def run(stdscr: curses.window) -> None:
             error_snapshot = error_message
             playlists_snapshot = list(playlists)
             selected_snapshot = selected_index
-            scroll_snapshot = scroll_offset
 
         stdscr.erase()
         rows, cols = stdscr.getmaxyx()
@@ -448,21 +447,14 @@ def run(stdscr: curses.window) -> None:
             stdscr.addnstr(list_header_row + 1, 0, "No playlists loaded yet.", width)
         else:
             max_visible = max(1, rows - (list_header_row + 2))
-            selected_snapshot = max(0, min(selected_snapshot, len(playlists_snapshot) - 1))
-            render_scroll_offset = scroll_snapshot
-            if selected_snapshot < render_scroll_offset:
-                render_scroll_offset = selected_snapshot
-            elif selected_snapshot >= render_scroll_offset + max_visible:
-                render_scroll_offset = selected_snapshot - max_visible + 1
+            if selected_snapshot < scroll_offset:
+                scroll_offset = selected_snapshot
+            elif selected_snapshot >= scroll_offset + max_visible:
+                scroll_offset = selected_snapshot - max_visible + 1
 
-            with connection_lock:
-                scroll_offset = render_scroll_offset
-
-            visible = playlists_snapshot[
-                render_scroll_offset : render_scroll_offset + max_visible
-            ]
+            visible = playlists_snapshot[scroll_offset : scroll_offset + max_visible]
             for row_offset, (name, track_total) in enumerate(visible):
-                playlist_index = render_scroll_offset + row_offset
+                playlist_index = scroll_offset + row_offset
                 line = f"{playlist_index + 1}. {name} ({track_total} tracks)"
                 attr = curses.A_REVERSE if playlist_index == selected_snapshot else curses.A_NORMAL
                 stdscr.addnstr(list_header_row + 1 + row_offset, 0, line, width, attr)

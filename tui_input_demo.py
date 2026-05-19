@@ -392,7 +392,7 @@ def run(stdscr: curses.window) -> None:
 
     def connect_worker() -> None:
         nonlocal connection_status, connection_messages
-        messages: list[str]
+        messages: list[str] = []
         try:
             messages = connect_and_get_playlist_lines()
         except (
@@ -441,16 +441,16 @@ def run(stdscr: curses.window) -> None:
         if key in (ord("q"), ord("Q")):
             break
         if key in (ord("c"), ord("C")):
-            thread_to_start: threading.Thread | None = None
+            should_start_connection = False
             with connection_lock:
                 if connection_status == "running":
                     history.append("Connection already in progress...")
                 else:
                     history.append("Connecting to Spotify...")
                     connection_status = "running"
-                    thread_to_start = threading.Thread(target=connect_worker, daemon=True)
-            if thread_to_start is not None:
-                thread_to_start.start()
+                    should_start_connection = True
+            if should_start_connection:
+                threading.Thread(target=connect_worker, daemon=True).start()
             continue
         label = KEY_LABELS.get(key, f"KEYCODE {key}")
         history.append(label)

@@ -42,6 +42,7 @@ DEFAULT_TOKEN_EXPIRY_SECONDS = 3600
 INITIAL_BACKOFF_SECONDS = 1.0
 PKCE_VERIFIER_BYTES = 64
 DEFAULT_PLAYLIST_NAME = "Unnamed Playlist"
+UI_POLL_INTERVAL_MS = 100
 
 
 def _base64_url_encode(data: bytes) -> str:
@@ -56,6 +57,10 @@ def _build_pkce_pair() -> tuple[str, str]:
 
 
 def _open_authorization_page(auth_url: str) -> None:
+    parsed_auth_url = urllib.parse.urlparse(auth_url)
+    if parsed_auth_url.scheme != "https" or not parsed_auth_url.netloc:
+        raise RuntimeError("Generated Spotify authorization URL is invalid.")
+
     xdg_open = shutil.which("xdg-open")
     if xdg_open:
         try:
@@ -382,7 +387,7 @@ def connect_and_get_playlist_lines() -> list[str]:
 
 def run(stdscr: curses.window) -> None:
     curses.curs_set(0)
-    stdscr.timeout(100)
+    stdscr.timeout(UI_POLL_INTERVAL_MS)
     stdscr.keypad(True)
 
     history: list[str] = ["Press c to connect to Spotify with PKCE."]

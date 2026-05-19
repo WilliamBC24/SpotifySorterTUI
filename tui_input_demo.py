@@ -25,6 +25,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 SPOTIFY_AUTH_URL = "https://accounts.spotify.com/authorize"
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 SPOTIFY_PLAYLISTS_URL = "https://api.spotify.com/v1/me/playlists"
+SPOTIFY_PLAYLIST_FIELDS = "items(name,tracks(total)),next,total"
 SPOTIFY_SCOPE = "playlist-read-private playlist-read-collaborative"
 SPOTIFY_MAX_RETRIES = 4
 TOKEN_EXPIRY_BUFFER_SECONDS = 30
@@ -308,11 +309,25 @@ def _get_access_token(client_id: str, token_cache: dict[str, object]) -> str:
     return str(token_cache["access_token"])
 
 
-def _fetch_user_playlists(client_id: str, token_cache: dict[str, object]) -> list[tuple[str, int]]:
+def _fetch_user_playlists(
+    client_id: str,
+    token_cache: dict[str, object],
+    status_callback: Callable[[str], None] | None = None,
+) -> list[tuple[str, int]]:
     playlists: list[tuple[str, int]] = []
-    next_url = f"{SPOTIFY_PLAYLISTS_URL}?limit=50"
+    query = urllib.parse.urlencode(
+        {
+            "limit": 50,
+            "fields": SPOTIFY_PLAYLIST_FIELDS,
+        }
+    )
+    next_url = f"{SPOTIFY_PLAYLISTS_URL}?{query}"
+    page_count = 0
 
     while next_url:
+        page_count += 1
+        if status_callback is not None:
+            status_callback(f"Fetching playlists from Spotify (page {page_count})...")
         access_token = _get_access_token(client_id, token_cache)
         payload = _spotify_request_json(
             next_url,
@@ -371,7 +386,7 @@ def connect_and_get_playlists(
     if status_callback is not None:
         status_callback("Authorization approved. Fetching playlists from Spotify...")
     tokens = _exchange_code_for_token(client_id, redirect_uri, code, code_verifier)
-    playlists = _fetch_user_playlists(client_id, tokens)
+    playlists = _fetch_user_playlists(client_id, tokens, status_callback=status_callback)
     return playlists
 
 

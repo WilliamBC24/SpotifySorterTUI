@@ -389,7 +389,7 @@ def run(stdscr: curses.window) -> None:
     scroll_offset = 0
 
     def connect_worker() -> None:
-        nonlocal connection_status, status_message, error_message, playlists, selected_index, scroll_offset
+        nonlocal connection_status, status_message, error_message, playlists, selected_index
 
         def update_status(message: str) -> None:
             nonlocal status_message
@@ -401,7 +401,6 @@ def run(stdscr: curses.window) -> None:
             with connection_lock:
                 playlists = fetched_playlists
                 selected_index = 0
-                scroll_offset = 0
                 error_message = ""
                 connection_status = "idle"
                 if playlists:

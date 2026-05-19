@@ -34,6 +34,7 @@ SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 SPOTIFY_PLAYLISTS_URL = "https://api.spotify.com/v1/me/playlists"
 SPOTIFY_SCOPE = "playlist-read-private playlist-read-collaborative"
 SPOTIFY_MAX_RETRIES = 4
+TOKEN_EXPIRY_BUFFER_SECONDS = 30
 
 
 def _base64_url_encode(data: bytes) -> str:
@@ -41,7 +42,10 @@ def _base64_url_encode(data: bytes) -> str:
 
 
 def _build_pkce_pair() -> tuple[str, str]:
-    code_verifier = secrets.token_urlsafe(96)[:128]
+    code_verifier = secrets.token_urlsafe(64)
+    if len(code_verifier) < 43:
+        code_verifier += secrets.token_urlsafe(32)
+    code_verifier = code_verifier[:128]
     challenge_raw = hashlib.sha256(code_verifier.encode("utf-8")).digest()
     code_challenge = _base64_url_encode(challenge_raw)
     return code_verifier, code_challenge
@@ -224,7 +228,7 @@ def _exchange_code_for_token(
     return {
         "access_token": access_token,
         "refresh_token": payload.get("refresh_token"),
-        "expires_at": time.time() + expires_in - 30,
+        "expires_at": time.time() + expires_in - TOKEN_EXPIRY_BUFFER_SECONDS,
     }
 
 
@@ -245,7 +249,7 @@ def _refresh_access_token(client_id: str, refresh_token: str) -> dict[str, objec
     return {
         "access_token": access_token,
         "refresh_token": payload.get("refresh_token", refresh_token),
-        "expires_at": time.time() + expires_in - 30,
+        "expires_at": time.time() + expires_in - TOKEN_EXPIRY_BUFFER_SECONDS,
     }
 
 

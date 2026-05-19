@@ -39,8 +39,9 @@ def run(stdscr: curses.window) -> None:
         available_lines = max(1, rows - 5)
         visible_history = history[-available_lines:]
         start_number = len(history) - len(visible_history) + 1
-        for index, item in enumerate(visible_history, start=start_number):
-            stdscr.addnstr(3 + index - start_number + 1, 0, f"{index}. {item}", cols - 1)
+        for row_offset, item in enumerate(visible_history):
+            event_number = start_number + row_offset
+            stdscr.addnstr(4 + row_offset, 0, f"{event_number}. {item}", cols - 1)
 
         stdscr.refresh()
 

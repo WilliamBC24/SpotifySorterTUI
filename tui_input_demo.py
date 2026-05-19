@@ -37,8 +37,10 @@ def run(stdscr: curses.window) -> None:
         stdscr.addnstr(3, 0, "Captured input:", cols - 1)
 
         available_lines = max(1, rows - 5)
-        for index, item in enumerate(history[-available_lines:]):
-            stdscr.addnstr(4 + index, 0, f"{index + 1}. {item}", cols - 1)
+        visible_history = history[-available_lines:]
+        start_number = len(history) - len(visible_history) + 1
+        for index, item in enumerate(visible_history, start=start_number):
+            stdscr.addnstr(3 + index - start_number + 1, 0, f"{index}. {item}", cols - 1)
 
         stdscr.refresh()
 

@@ -35,6 +35,10 @@ SPOTIFY_PLAYLISTS_URL = "https://api.spotify.com/v1/me/playlists"
 SPOTIFY_SCOPE = "playlist-read-private playlist-read-collaborative"
 SPOTIFY_MAX_RETRIES = 4
 TOKEN_EXPIRY_BUFFER_SECONDS = 30
+DEFAULT_TOKEN_EXPIRY_SECONDS = 3600
+INITIAL_BACKOFF_SECONDS = 1.0
+PKCE_VERIFIER_BYTES = 96
+PKCE_VERIFIER_MAX_LENGTH = 128
 
 
 def _base64_url_encode(data: bytes) -> str:
@@ -42,7 +46,7 @@ def _base64_url_encode(data: bytes) -> str:
 
 
 def _build_pkce_pair() -> tuple[str, str]:
-    code_verifier = secrets.token_urlsafe(96)[:128]
+    code_verifier = secrets.token_urlsafe(PKCE_VERIFIER_BYTES)[:PKCE_VERIFIER_MAX_LENGTH]
     challenge_raw = hashlib.sha256(code_verifier.encode("utf-8")).digest()
     code_challenge = _base64_url_encode(challenge_raw)
     return code_verifier, code_challenge
@@ -174,7 +178,7 @@ def _spotify_request_json(
         body = urllib.parse.urlencode(form_body).encode("utf-8")
         request_headers["Content-Type"] = "application/x-www-form-urlencoded"
 
-    backoff_seconds = 1.0
+    backoff_seconds = INITIAL_BACKOFF_SECONDS
     for attempt in range(max_retries + 1):
         request = urllib.request.Request(url, data=body, method=method, headers=request_headers)
         try:
@@ -220,7 +224,7 @@ def _exchange_code_for_token(
     access_token = payload.get("access_token")
     if not access_token:
         raise RuntimeError("No access token received from Spotify.")
-    expires_in = _safe_int(payload.get("expires_in", 3600), 3600)
+    expires_in = _safe_int(payload.get("expires_in", DEFAULT_TOKEN_EXPIRY_SECONDS), DEFAULT_TOKEN_EXPIRY_SECONDS)
     return {
         "access_token": access_token,
         "refresh_token": payload.get("refresh_token"),
@@ -241,7 +245,7 @@ def _refresh_access_token(client_id: str, refresh_token: str) -> dict[str, objec
     access_token = payload.get("access_token")
     if not access_token:
         raise RuntimeError("Spotify refresh response did not include an access token.")
-    expires_in = _safe_int(payload.get("expires_in", 3600), 3600)
+    expires_in = _safe_int(payload.get("expires_in", DEFAULT_TOKEN_EXPIRY_SECONDS), DEFAULT_TOKEN_EXPIRY_SECONDS)
     return {
         "access_token": access_token,
         "refresh_token": payload.get("refresh_token", refresh_token),
@@ -350,7 +354,7 @@ def run(stdscr: curses.window) -> None:
         stdscr.erase()
         rows, cols = stdscr.getmaxyx()
 
-        title = "Spotify Sorter TUI - Spotify Connection"
+        title = "Spotify Playlist Viewer TUI - Spotify Connection"
         help_text = "Press c to connect. Press q to quit."
         width = max(1, cols - 1)
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import curses
 import base64
+import concurrent.futures
 import datetime
 import hashlib
 import json
@@ -25,7 +26,6 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 SPOTIFY_AUTH_URL = "https://accounts.spotify.com/authorize"
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 SPOTIFY_PLAYLISTS_URL = "https://api.spotify.com/v1/me/playlists"
-SPOTIFY_PLAYLIST_FIELDS = "items(name,tracks(total)),next,total"
 SPOTIFY_SCOPE = "playlist-read-private playlist-read-collaborative"
 SPOTIFY_MAX_RETRIES = 4
 TOKEN_EXPIRY_BUFFER_SECONDS = 30
@@ -34,6 +34,8 @@ INITIAL_BACKOFF_SECONDS = 1.0
 PKCE_VERIFIER_BYTES = 64
 DEFAULT_PLAYLIST_NAME = "Unnamed Playlist"
 UI_POLL_INTERVAL_MS = 100
+PLAYLIST_PAGE_LIMIT = 50
+MAX_PLAYLIST_FETCH_WORKERS = 8
 
 
 def _base64_url_encode(data: bytes) -> str:
@@ -314,42 +316,85 @@ def _fetch_user_playlists(
     token_cache: dict[str, object],
     status_callback: Callable[[str], None] | None = None,
 ) -> list[tuple[str, int]]:
-    playlists: list[tuple[str, int]] = []
-    query = urllib.parse.urlencode(
-        {
-            "limit": 50,
-            "fields": SPOTIFY_PLAYLIST_FIELDS,
-        }
-    )
-    next_url = f"{SPOTIFY_PLAYLISTS_URL}?{query}"
-    page_count = 0
+    def build_page_url(offset: int) -> str:
+        query = urllib.parse.urlencode({"limit": PLAYLIST_PAGE_LIMIT, "offset": offset})
+        return f"{SPOTIFY_PLAYLISTS_URL}?{query}"
 
-    while next_url:
-        page_count += 1
-        if status_callback is not None:
-            status_callback(f"Fetching playlists from Spotify (page {page_count})...")
-        access_token = _get_access_token(client_id, token_cache)
-        payload = _spotify_request_json(
-            next_url,
-            headers={"Authorization": f"Bearer {access_token}"},
-        )
+    def get_track_total(item: dict[str, object]) -> int:
+        tracks = item.get("tracks")
+        if isinstance(tracks, dict):
+            return _safe_int(tracks.get("total"), 0)
+        if isinstance(tracks, int):
+            return tracks
+        return _safe_int(item.get("tracks_total"), 0)
 
-        for item in payload.get("items", []):
+    def parse_items(payload: dict[str, object]) -> list[tuple[str, int]]:
+        parsed: list[tuple[str, int]] = []
+        items = payload.get("items")
+        if not isinstance(items, list):
+            return parsed
+        for item in items:
             if not isinstance(item, dict):
                 continue
             raw_name = item.get("name")
             name = raw_name if isinstance(raw_name, str) and raw_name else DEFAULT_PLAYLIST_NAME
-            tracks = item.get("tracks", {})
-            track_total = 0
-            if isinstance(tracks, dict):
-                raw_total = tracks.get("total", 0)
-                if isinstance(raw_total, int):
-                    track_total = raw_total
-            playlists.append((name, track_total))
+            parsed.append((name, get_track_total(item)))
+        return parsed
 
-        raw_next = payload.get("next")
-        next_url = raw_next if isinstance(raw_next, str) and raw_next else ""
+    token_lock = threading.Lock()
 
+    def fetch_page(offset: int) -> tuple[int, dict[str, object]]:
+        with token_lock:
+            access_token = _get_access_token(client_id, token_cache)
+        payload = _spotify_request_json(
+            build_page_url(offset),
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        return offset, payload
+
+    if status_callback is not None:
+        status_callback("Fetching playlists from Spotify (page 1)...")
+    _, first_page = fetch_page(0)
+    total_playlists = _safe_int(first_page.get("total"), 0)
+    page_payloads: dict[int, dict[str, object]] = {0: first_page}
+
+    if total_playlists > PLAYLIST_PAGE_LIMIT:
+        offsets = list(range(PLAYLIST_PAGE_LIMIT, total_playlists, PLAYLIST_PAGE_LIMIT))
+        total_pages = len(offsets) + 1
+        worker_count = min(MAX_PLAYLIST_FETCH_WORKERS, len(offsets))
+        if worker_count > 0:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+                futures = [executor.submit(fetch_page, offset) for offset in offsets]
+                completed = 1
+                for future in concurrent.futures.as_completed(futures):
+                    offset, payload = future.result()
+                    page_payloads[offset] = payload
+                    completed += 1
+                    if status_callback is not None:
+                        status_callback(
+                            f"Fetching playlists from Spotify ({completed}/{total_pages} pages)..."
+                        )
+    else:
+        next_url = first_page.get("next")
+        page_index = 1
+        next_offset = PLAYLIST_PAGE_LIMIT
+        while isinstance(next_url, str) and next_url:
+            page_index += 1
+            if status_callback is not None:
+                status_callback(f"Fetching playlists from Spotify (page {page_index})...")
+            with token_lock:
+                access_token = _get_access_token(client_id, token_cache)
+            payload = _spotify_request_json(
+                next_url,
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            page_payloads[next_offset] = payload
+            next_offset += PLAYLIST_PAGE_LIMIT
+            next_url = payload.get("next")
+
+    playlists: list[tuple[str, int]] = []
+    for offset in sorted(page_payloads.keys()):
+        playlists.extend(parse_items(page_payloads[offset]))
     return playlists
 
 

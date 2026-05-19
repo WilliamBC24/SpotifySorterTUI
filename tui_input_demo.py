@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import curses
+import base64
 import hashlib
 import json
 import os
@@ -32,12 +33,11 @@ SPOTIFY_AUTH_URL = "https://accounts.spotify.com/authorize"
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 SPOTIFY_PLAYLISTS_URL = "https://api.spotify.com/v1/me/playlists"
 SPOTIFY_SCOPE = "playlist-read-private playlist-read-collaborative"
+SPOTIFY_MAX_RETRIES = 4
 
 
 def _base64_url_encode(data: bytes) -> str:
-    return urllib.parse.quote_from_bytes(
-        __import__("base64").urlsafe_b64encode(data).rstrip(b"=")
-    )
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("utf-8")
 
 
 def _build_pkce_pair() -> tuple[str, str]:
@@ -47,10 +47,25 @@ def _build_pkce_pair() -> tuple[str, str]:
     return code_verifier, code_challenge
 
 
-def _wait_for_auth_code(redirect_uri: str, expected_state: str, timeout_seconds: int = 180) -> str:
+def _validate_redirect_uri(redirect_uri: str) -> urllib.parse.ParseResult:
     parsed = urllib.parse.urlparse(redirect_uri)
-    if parsed.scheme != "http" or not parsed.hostname or not parsed.port:
-        raise RuntimeError("SPOTIFY_REDIRECT_URI must be an http:// URL with explicit host and port.")
+    if not parsed.hostname:
+        raise RuntimeError("SPOTIFY_REDIRECT_URI must include a hostname.")
+    if parsed.scheme == "https":
+        return parsed
+    if parsed.scheme == "http" and parsed.hostname == "127.0.0.1":
+        return parsed
+    raise RuntimeError(
+        "SPOTIFY_REDIRECT_URI must use https://, except http://127.0.0.1 for local development."
+    )
+
+
+def _wait_for_auth_code(redirect_uri: str, expected_state: str, timeout_seconds: int = 180) -> str:
+    parsed = _validate_redirect_uri(redirect_uri)
+    if parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or not parsed.port:
+        raise RuntimeError(
+            "Local callback listener requires SPOTIFY_REDIRECT_URI like http://127.0.0.1:8888/callback."
+        )
 
     result: dict[str, str] = {}
     done = threading.Event()
@@ -109,46 +124,158 @@ def _wait_for_auth_code(redirect_uri: str, expected_state: str, timeout_seconds:
     return result["code"]
 
 
-def _exchange_code_for_token(client_id: str, redirect_uri: str, code: str, code_verifier: str) -> str:
-    body = urllib.parse.urlencode(
-        {
+def _read_error_message(error_body: bytes, status_code: int) -> str:
+    default_message = f"HTTP {status_code}"
+    if not error_body:
+        return default_message
+    try:
+        payload = json.loads(error_body.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return default_message
+
+    if isinstance(payload, dict):
+        nested_error = payload.get("error")
+        if isinstance(nested_error, dict):
+            message = nested_error.get("message")
+            if isinstance(message, str) and message.strip():
+                return message.strip()
+        if isinstance(nested_error, str):
+            description = payload.get("error_description")
+            if isinstance(description, str) and description.strip():
+                return f"{nested_error}: {description.strip()}"
+            if nested_error.strip():
+                return nested_error.strip()
+    return default_message
+
+
+def _spotify_request_json(
+    url: str,
+    *,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+    form_body: dict[str, str] | None = None,
+    max_retries: int = SPOTIFY_MAX_RETRIES,
+) -> dict[str, object]:
+    body: bytes | None = None
+    request_headers = dict(headers or {})
+    if form_body is not None:
+        body = urllib.parse.urlencode(form_body).encode("utf-8")
+        request_headers["Content-Type"] = "application/x-www-form-urlencoded"
+
+    backoff_seconds = 1.0
+    for attempt in range(max_retries + 1):
+        request = urllib.request.Request(url, data=body, method=method, headers=request_headers)
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                response_text = response.read().decode("utf-8")
+            payload = json.loads(response_text) if response_text else {}
+            if isinstance(payload, dict):
+                return payload
+            raise RuntimeError("Spotify returned an unexpected response format.")
+        except urllib.error.HTTPError as exc:
+            error_body = exc.read()
+            error_message = _read_error_message(error_body, exc.code)
+            if exc.code == 429 and attempt < max_retries:
+                retry_after_header = exc.headers.get("Retry-After", "").strip()
+                try:
+                    retry_after = max(0.0, float(retry_after_header))
+                except ValueError:
+                    retry_after = backoff_seconds
+                time.sleep(max(retry_after, backoff_seconds))
+                backoff_seconds *= 2.0
+                continue
+            raise RuntimeError(f"Spotify API error {exc.code}: {error_message}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Network error while contacting Spotify: {exc.reason}") from exc
+
+    raise RuntimeError("Spotify request failed after retries.")
+
+
+def _exchange_code_for_token(
+    client_id: str, redirect_uri: str, code: str, code_verifier: str
+) -> dict[str, object]:
+    payload = _spotify_request_json(
+        SPOTIFY_TOKEN_URL,
+        method="POST",
+        form_body={
             "client_id": client_id,
             "grant_type": "authorization_code",
             "code": code,
             "redirect_uri": redirect_uri,
             "code_verifier": code_verifier,
-        }
-    ).encode("utf-8")
-    request = urllib.request.Request(
-        SPOTIFY_TOKEN_URL,
-        data=body,
-        method="POST",
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        },
     )
-    with urllib.request.urlopen(request, timeout=20) as response:
-        payload = json.loads(response.read().decode("utf-8"))
     access_token = payload.get("access_token")
     if not access_token:
         raise RuntimeError("No access token received from Spotify.")
-    return access_token
+    expires_in = int(payload.get("expires_in", 3600))
+    return {
+        "access_token": access_token,
+        "refresh_token": payload.get("refresh_token"),
+        "expires_at": time.time() + expires_in - 30,
+    }
 
 
-def _fetch_user_playlists(access_token: str) -> list[tuple[str, int]]:
+def _refresh_access_token(client_id: str, refresh_token: str) -> dict[str, object]:
+    payload = _spotify_request_json(
+        SPOTIFY_TOKEN_URL,
+        method="POST",
+        form_body={
+            "client_id": client_id,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        },
+    )
+    access_token = payload.get("access_token")
+    if not access_token:
+        raise RuntimeError("Spotify refresh response did not include an access token.")
+    expires_in = int(payload.get("expires_in", 3600))
+    return {
+        "access_token": access_token,
+        "refresh_token": payload.get("refresh_token", refresh_token),
+        "expires_at": time.time() + expires_in - 30,
+    }
+
+
+def _get_access_token(client_id: str, tokens: dict[str, object]) -> str:
+    access_token = tokens.get("access_token")
+    expires_at = float(tokens.get("expires_at", 0))
+    if isinstance(access_token, str) and access_token and time.time() < expires_at:
+        return access_token
+
+    refresh_token = tokens.get("refresh_token")
+    if not isinstance(refresh_token, str) or not refresh_token:
+        raise RuntimeError("Access token expired and no refresh token is available.")
+    refreshed = _refresh_access_token(client_id, refresh_token)
+    tokens.update(refreshed)
+    return str(tokens["access_token"])
+
+
+def _fetch_user_playlists(client_id: str, tokens: dict[str, object]) -> list[tuple[str, int]]:
     playlists: list[tuple[str, int]] = []
     next_url = f"{SPOTIFY_PLAYLISTS_URL}?limit=50"
-    headers = {"Authorization": f"Bearer {access_token}"}
 
     while next_url:
-        request = urllib.request.Request(next_url, headers=headers)
-        with urllib.request.urlopen(request, timeout=20) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+        access_token = _get_access_token(client_id, tokens)
+        payload = _spotify_request_json(
+            next_url,
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
 
         for item in payload.get("items", []):
-            name = item.get("name", "Unnamed Playlist")
-            track_total = item.get("tracks", {}).get("total", 0)
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "Unnamed Playlist"))
+            tracks = item.get("tracks", {})
+            track_total = 0
+            if isinstance(tracks, dict):
+                raw_total = tracks.get("total", 0)
+                if isinstance(raw_total, int):
+                    track_total = raw_total
             playlists.append((name, track_total))
 
-        next_url = payload.get("next")
+        raw_next = payload.get("next")
+        next_url = raw_next if isinstance(raw_next, str) and raw_next else ""
 
     return playlists
 
@@ -158,6 +285,7 @@ def connect_and_get_playlist_lines() -> list[str]:
     redirect_uri = os.getenv("SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8888/callback").strip()
     if not client_id:
         raise RuntimeError("Set SPOTIFY_CLIENT_ID before connecting to Spotify.")
+    _validate_redirect_uri(redirect_uri)
 
     code_verifier, code_challenge = _build_pkce_pair()
     state = secrets.token_urlsafe(32)
@@ -176,10 +304,10 @@ def connect_and_get_playlist_lines() -> list[str]:
 
     webbrowser.open(auth_url)
     code = _wait_for_auth_code(redirect_uri, state)
-    access_token = _exchange_code_for_token(client_id, redirect_uri, code, code_verifier)
-    playlists = _fetch_user_playlists(access_token)
+    tokens = _exchange_code_for_token(client_id, redirect_uri, code, code_verifier)
+    playlists = _fetch_user_playlists(client_id, tokens)
 
-    lines = [f"Fetched {len(playlists)} playlist(s):"]
+    lines = ["Playlist data provided by Spotify.", f"Fetched {len(playlists)} playlist(s):"]
     if not playlists:
         lines.append("No playlists found for this user.")
         return lines

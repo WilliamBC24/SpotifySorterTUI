@@ -3,7 +3,7 @@ Terminal-based Spotify playlist organizer with keyboard-driven navigation.
 
 ## TUI Input Demo
 
-This repository includes a minimal TUI demo with Spotify PKCE connection and playlist listing.
+This repository includes a TUI demo with Spotify PKCE connection and interactive playlist navigation.
 
 ### Run
 
@@ -16,7 +16,6 @@ python3 tui_input_demo.py
 
 ### Controls
 
-- Arrow keys: recorded as `UP`, `DOWN`, `LEFT`, `RIGHT`
-- Enter: recorded as `ENTER`
-- `c`: connect to Spotify (Authorization Code with PKCE) and print playlists with song counts
+- `c`: connect/reload from Spotify (Authorization Code with PKCE)
+- `↑` / `↓`: move the highlighted playlist selection
 - `q`: quit the demo

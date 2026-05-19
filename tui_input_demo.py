@@ -386,7 +386,6 @@ def run(stdscr: curses.window) -> None:
     error_message = ""
     playlists: list[tuple[str, int]] = []
     selected_index = 0
-    scroll_offset = 0
 
     def connect_worker() -> None:
         nonlocal connection_status, status_message, error_message, playlists, selected_index
@@ -447,14 +446,10 @@ def run(stdscr: curses.window) -> None:
             stdscr.addnstr(list_header_row + 1, 0, "No playlists loaded yet.", width)
         else:
             max_visible = max(1, rows - (list_header_row + 2))
-            if selected_snapshot < scroll_offset:
-                scroll_offset = selected_snapshot
-            elif selected_snapshot >= scroll_offset + max_visible:
-                scroll_offset = selected_snapshot - max_visible + 1
-
-            visible = playlists_snapshot[scroll_offset : scroll_offset + max_visible]
+            start_index = max(0, selected_snapshot - max_visible + 1)
+            visible = playlists_snapshot[start_index : start_index + max_visible]
             for row_offset, (name, track_total) in enumerate(visible):
-                playlist_index = scroll_offset + row_offset
+                playlist_index = start_index + row_offset
                 line = f"{playlist_index + 1}. {name} ({track_total} tracks)"
                 attr = curses.A_REVERSE if playlist_index == selected_snapshot else curses.A_NORMAL
                 stdscr.addnstr(list_header_row + 1 + row_offset, 0, line, width, attr)

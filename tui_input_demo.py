@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import curses
 import base64
+import datetime
 import hashlib
 import json
 import os
@@ -37,8 +38,8 @@ SPOTIFY_MAX_RETRIES = 4
 TOKEN_EXPIRY_BUFFER_SECONDS = 30
 DEFAULT_TOKEN_EXPIRY_SECONDS = 3600
 INITIAL_BACKOFF_SECONDS = 1.0
-PKCE_VERIFIER_BYTES = 96
-PKCE_VERIFIER_MAX_LENGTH = 128
+PKCE_VERIFIER_BYTES = 64
+DEFAULT_PLAYLIST_NAME = "Unnamed Playlist"
 
 
 def _base64_url_encode(data: bytes) -> str:
@@ -46,7 +47,7 @@ def _base64_url_encode(data: bytes) -> str:
 
 
 def _build_pkce_pair() -> tuple[str, str]:
-    code_verifier = secrets.token_urlsafe(PKCE_VERIFIER_BYTES)[:PKCE_VERIFIER_MAX_LENGTH]
+    code_verifier = secrets.token_urlsafe(PKCE_VERIFIER_BYTES)
     challenge_raw = hashlib.sha256(code_verifier.encode("utf-8")).digest()
     code_challenge = _base64_url_encode(challenge_raw)
     return code_verifier, code_challenge
@@ -197,6 +198,15 @@ def _spotify_request_json(
                     sleep_seconds = max(0.0, float(retry_after_header))
                 except ValueError:
                     sleep_seconds = backoff_seconds
+                    try:
+                        retry_after_time = datetime.datetime.strptime(
+                            retry_after_header,
+                            "%a, %d %b %Y %H:%M:%S GMT",
+                        ).replace(tzinfo=datetime.timezone.utc)
+                        now_utc = datetime.datetime.now(datetime.timezone.utc)
+                        sleep_seconds = max(0.0, (retry_after_time - now_utc).total_seconds())
+                    except ValueError:
+                        pass
                 time.sleep(sleep_seconds)
                 backoff_seconds *= 2.0
                 continue
@@ -291,7 +301,7 @@ def _fetch_user_playlists(client_id: str, token_cache: dict[str, object]) -> lis
             if not isinstance(item, dict):
                 continue
             raw_name = item.get("name")
-            name = raw_name if isinstance(raw_name, str) and raw_name else "Unnamed Playlist"
+            name = raw_name if isinstance(raw_name, str) and raw_name else DEFAULT_PLAYLIST_NAME
             tracks = item.get("tracks", {})
             track_total = 0
             if isinstance(tracks, dict):

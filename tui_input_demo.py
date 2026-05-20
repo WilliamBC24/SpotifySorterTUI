@@ -19,13 +19,15 @@ import urllib.parse
 import urllib.request
 import webbrowser
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
 SPOTIFY_AUTH_URL = "https://accounts.spotify.com/authorize"
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 SPOTIFY_PLAYLISTS_URL = "https://api.spotify.com/v1/me/playlists"
-SPOTIFY_PLAYLIST_FIELDS = "items(name,tracks(total)),next,total"
+SPOTIFY_PLAYLIST_FIELDS = "items(id,name,snapshot_id,tracks(total)),next,total"
+SPOTIFY_PLAYLIST_TRACKS_FIELDS = "items(track(name,artists(name))),next,total"
 SPOTIFY_SCOPE = "playlist-read-private playlist-read-collaborative"
 SPOTIFY_MAX_RETRIES = 4
 TOKEN_EXPIRY_BUFFER_SECONDS = 30
@@ -33,7 +35,39 @@ DEFAULT_TOKEN_EXPIRY_SECONDS = 3600
 INITIAL_BACKOFF_SECONDS = 1.0
 PKCE_VERIFIER_BYTES = 64
 DEFAULT_PLAYLIST_NAME = "Unnamed Playlist"
+DEFAULT_TRACK_NAME = "Unknown Track"
 UI_POLL_INTERVAL_MS = 100
+DEFAULT_SPOTIFY_SYNC_INTERVAL_SECONDS = 60
+UI_HELP_TEXT = "c: connect (disconnected only)  ↑/↓: move selection  Enter: open songs  q: quit"
+MIN_COLS_FOR_SPLIT_PANE = 70
+MIN_LEFT_PANEL_WIDTH = 24
+ENTER_KEY_CODES = (curses.KEY_ENTER, 10, 13)
+
+
+@dataclass(slots=True)
+class PlaylistInfo:
+    id: str
+    name: str
+    track_total: int
+    snapshot_id: str = ""
+    tracks: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class SpotifySession:
+    client_id: str
+    token_cache: dict[str, object]
+
+
+@dataclass(slots=True)
+class UiState:
+    connection_status: str = "disconnected"
+    status_message: str = "Press c to connect to Spotify with PKCE."
+    error_message: str = ""
+    playlists: list[PlaylistInfo] = field(default_factory=list)
+    selected_index: int = 0
+    opened_playlist_id: str | None = None
+    session: SpotifySession | None = None
 
 
 def _base64_url_encode(data: bytes) -> str:
@@ -188,6 +222,14 @@ def _safe_int(value: object, default: int) -> int:
     return default
 
 
+def _safe_non_empty_string(value: object, default: str) -> str:
+    if isinstance(value, str):
+        normalized = value.strip()
+        if normalized:
+            return normalized
+    return default
+
+
 def _spotify_request_json(
     url: str,
     *,
@@ -309,12 +351,78 @@ def _get_access_token(client_id: str, token_cache: dict[str, object]) -> str:
     return str(token_cache["access_token"])
 
 
+def _parse_playlist_item(item: object) -> PlaylistInfo | None:
+    if not isinstance(item, dict):
+        return None
+    playlist_id = item.get("id")
+    if not isinstance(playlist_id, str) or not playlist_id:
+        return None
+    name = _safe_non_empty_string(item.get("name"), DEFAULT_PLAYLIST_NAME)
+    snapshot_id = _safe_non_empty_string(item.get("snapshot_id"), "")
+    tracks_value = item.get("tracks", {})
+    track_total = 0
+    if isinstance(tracks_value, dict):
+        track_total = _safe_int(tracks_value.get("total"), 0)
+    return PlaylistInfo(id=playlist_id, name=name, track_total=max(0, track_total), snapshot_id=snapshot_id)
+
+
+def _parse_track_item(item: object) -> str:
+    if not isinstance(item, dict):
+        return DEFAULT_TRACK_NAME
+    track = item.get("track")
+    if not isinstance(track, dict):
+        return DEFAULT_TRACK_NAME
+    track_name = _safe_non_empty_string(track.get("name"), DEFAULT_TRACK_NAME)
+    artists_raw = track.get("artists", [])
+    artist_names: list[str] = []
+    if isinstance(artists_raw, list):
+        for artist in artists_raw:
+            if not isinstance(artist, dict):
+                continue
+            artist_name = _safe_non_empty_string(artist.get("name"), "")
+            if artist_name:
+                artist_names.append(artist_name)
+    if not artist_names:
+        return track_name
+    return f"{track_name} — {', '.join(artist_names)}"
+
+
+def _fetch_playlist_tracks(
+    client_id: str,
+    token_cache: dict[str, object],
+    playlist_id: str,
+) -> list[str]:
+    track_entries: list[str] = []
+    query = urllib.parse.urlencode(
+        {
+            "limit": 100,
+            "fields": SPOTIFY_PLAYLIST_TRACKS_FIELDS,
+        }
+    )
+    quoted_playlist_id = urllib.parse.quote(playlist_id, safe="")
+    next_url = f"https://api.spotify.com/v1/playlists/{quoted_playlist_id}/tracks?{query}"
+    while next_url:
+        access_token = _get_access_token(client_id, token_cache)
+        payload = _spotify_request_json(
+            next_url,
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        items = payload.get("items", [])
+        if not isinstance(items, list):
+            items = []
+        for item in items:
+            track_entries.append(_parse_track_item(item))
+        raw_next = payload.get("next")
+        next_url = raw_next if isinstance(raw_next, str) and raw_next else ""
+    return track_entries
+
+
 def _fetch_user_playlists(
     client_id: str,
     token_cache: dict[str, object],
     status_callback: Callable[[str], None] | None = None,
-) -> list[tuple[str, int]]:
-    playlists: list[tuple[str, int]] = []
+) -> list[PlaylistInfo]:
+    playlists: list[PlaylistInfo] = []
     query = urllib.parse.urlencode(
         {
             "limit": 50,
@@ -334,18 +442,13 @@ def _fetch_user_playlists(
             headers={"Authorization": f"Bearer {access_token}"},
         )
 
-        for item in payload.get("items", []):
-            if not isinstance(item, dict):
-                continue
-            raw_name = item.get("name")
-            name = raw_name if isinstance(raw_name, str) and raw_name else DEFAULT_PLAYLIST_NAME
-            tracks = item.get("tracks", {})
-            track_total = 0
-            if isinstance(tracks, dict):
-                raw_total = tracks.get("total", 0)
-                if isinstance(raw_total, int):
-                    track_total = raw_total
-            playlists.append((name, track_total))
+        items = payload.get("items", [])
+        if not isinstance(items, list):
+            items = []
+        for item in items:
+            playlist_info = _parse_playlist_item(item)
+            if playlist_info is not None:
+                playlists.append(playlist_info)
 
         raw_next = payload.get("next")
         next_url = raw_next if isinstance(raw_next, str) and raw_next else ""
@@ -353,9 +456,42 @@ def _fetch_user_playlists(
     return playlists
 
 
-def connect_and_get_playlists(
+def _hydrate_playlist_tracks(
+    client_id: str,
+    token_cache: dict[str, object],
+    playlists: list[PlaylistInfo],
     status_callback: Callable[[str], None] | None = None,
-) -> list[tuple[str, int]]:
+) -> list[PlaylistInfo]:
+    hydrated: list[PlaylistInfo] = []
+    total = len(playlists)
+    for index, playlist in enumerate(playlists, start=1):
+        if status_callback is not None:
+            status_callback(f"Fetching tracks for playlist {index}/{total}: {playlist.name}")
+        tracks = _fetch_playlist_tracks(client_id, token_cache, playlist.id)
+        updated_total = len(tracks)
+        hydrated.append(
+            PlaylistInfo(
+                id=playlist.id,
+                name=playlist.name,
+                track_total=updated_total,
+                snapshot_id=playlist.snapshot_id,
+                tracks=tracks,
+            )
+        )
+    return hydrated
+
+
+def _sync_playlists(
+    session: SpotifySession,
+    status_callback: Callable[[str], None] | None = None,
+) -> list[PlaylistInfo]:
+    playlists = _fetch_user_playlists(session.client_id, session.token_cache, status_callback=status_callback)
+    return _hydrate_playlist_tracks(session.client_id, session.token_cache, playlists, status_callback)
+
+
+def connect_and_get_session_playlists(
+    status_callback: Callable[[str], None] | None = None,
+) -> tuple[SpotifySession, list[PlaylistInfo]]:
     client_id = os.getenv("SPOTIFY_CLIENT_ID", "").strip()
     redirect_uri = os.getenv("SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8888/callback").strip()
     if not client_id:
@@ -386,8 +522,40 @@ def connect_and_get_playlists(
     if status_callback is not None:
         status_callback("Authorization approved. Fetching playlists from Spotify...")
     tokens = _exchange_code_for_token(client_id, redirect_uri, code, code_verifier)
-    playlists = _fetch_user_playlists(client_id, tokens, status_callback=status_callback)
-    return playlists
+    session = SpotifySession(client_id=client_id, token_cache=tokens)
+    playlists = _sync_playlists(session, status_callback=status_callback)
+    return session, playlists
+
+
+def _clamp_index(index: int, total: int) -> int:
+    if total <= 0:
+        return 0
+    return min(max(0, index), total - 1)
+
+
+def _find_playlist_by_id(playlists: list[PlaylistInfo], playlist_id: str | None) -> PlaylistInfo | None:
+    if not playlist_id:
+        return None
+    for playlist in playlists:
+        if playlist.id == playlist_id:
+            return playlist
+    return None
+
+
+def _add_line(
+    stdscr: curses.window,
+    row: int,
+    col: int,
+    text: str,
+    width: int,
+    attr: int = curses.A_NORMAL,
+) -> None:
+    if width <= 0:
+        return
+    rows, _cols = stdscr.getmaxyx()
+    if row < 0 or row >= rows:
+        return
+    stdscr.addnstr(row, col, text, width, attr)
 
 
 def run(stdscr: curses.window) -> None:
@@ -396,33 +564,37 @@ def run(stdscr: curses.window) -> None:
     stdscr.keypad(True)
 
     connection_lock = threading.Lock()
-    connection_status = "idle"
-    status_message = "Press c to connect to Spotify with PKCE."
-    error_message = ""
-    playlists: list[tuple[str, int]] = []
-    selected_index = 0
+    state = UiState()
+    stop_sync_event = threading.Event()
+    sync_interval_seconds = max(
+        10,
+        _safe_int(
+            os.getenv("SPOTIFY_SYNC_INTERVAL_SECONDS", str(DEFAULT_SPOTIFY_SYNC_INTERVAL_SECONDS)),
+            DEFAULT_SPOTIFY_SYNC_INTERVAL_SECONDS,
+        ),
+    )
 
     def connect_worker() -> None:
-        nonlocal connection_status, status_message, error_message, playlists, selected_index
-
         def update_status(message: str) -> None:
-            nonlocal status_message
             with connection_lock:
-                status_message = message
+                state.status_message = message
 
         try:
-            fetched_playlists = connect_and_get_playlists(status_callback=update_status)
+            established_session, fetched_playlists = connect_and_get_session_playlists(
+                status_callback=update_status
+            )
             with connection_lock:
-                playlists = fetched_playlists
-                selected_index = 0
-                error_message = ""
-                connection_status = "idle"
-                if playlists:
-                    status_message = (
-                        f"Fetched {len(playlists)} playlist(s). Use up/down arrow keys to navigate."
+                state.session = established_session
+                state.playlists = fetched_playlists
+                state.selected_index = 0
+                state.error_message = ""
+                state.connection_status = "connected"
+                if state.playlists:
+                    state.status_message = (
+                        f"Connected. Synced {len(state.playlists)} playlist(s). Use up/down and Enter."
                     )
                 else:
-                    status_message = "Connected. No playlists found for this user."
+                    state.status_message = "Connected. No playlists found for this user."
         except (
             RuntimeError,
             TimeoutError,
@@ -431,45 +603,114 @@ def run(stdscr: curses.window) -> None:
             UnicodeDecodeError,
         ) as exc:
             with connection_lock:
-                connection_status = "idle"
-                error_message = f"Connection failed: {exc}"
-                status_message = "Press c to retry Spotify connection."
+                state.session = None
+                state.connection_status = "disconnected"
+                state.error_message = f"Connection failed: {exc}"
+                state.status_message = "Press c to retry Spotify connection."
+
+    def sync_worker() -> None:
+        def update_sync_status(message: str) -> None:
+            with connection_lock:
+                if state.connection_status == "connected":
+                    state.status_message = message
+
+        while not stop_sync_event.wait(timeout=sync_interval_seconds):
+            try:
+                with connection_lock:
+                    active_session = state.session
+                    is_connected = (
+                        state.connection_status == "connected" and active_session is not None
+                    )
+                    if is_connected:
+                        state.status_message = "Connected. Syncing Spotify updates..."
+                if not is_connected:
+                    continue
+                refreshed_playlists = _sync_playlists(active_session, status_callback=update_sync_status)
+                with connection_lock:
+                    state.playlists = refreshed_playlists
+                    state.selected_index = _clamp_index(state.selected_index, len(state.playlists))
+                    if state.opened_playlist_id and not _find_playlist_by_id(
+                        state.playlists, state.opened_playlist_id
+                    ):
+                        state.opened_playlist_id = None
+                    state.error_message = ""
+                    state.status_message = f"Connected. Last synced at {time.strftime('%H:%M:%S')}."
+            except Exception as exc:
+                with connection_lock:
+                    state.session = None
+                    state.connection_status = "disconnected"
+                    state.error_message = f"Connection lost: {exc}"
+                    state.status_message = "Connection lost. Press c to reconnect."
+
+    threading.Thread(target=sync_worker, daemon=True).start()
 
     while True:
         with connection_lock:
-            status_snapshot = status_message
-            error_snapshot = error_message
-            playlists_snapshot = list(playlists)
-            selected_snapshot = selected_index
+            status_snapshot = state.status_message
+            error_snapshot = state.error_message
+            playlists_snapshot = list(state.playlists)
+            selected_snapshot = state.selected_index
+            opened_playlist_snapshot = state.opened_playlist_id
 
         stdscr.erase()
         rows, cols = stdscr.getmaxyx()
 
         title = "Spotify Playlist Viewer TUI"
-        help_text = "c: connect/reload  ↑/↓: move selection  q: quit"
         width = max(1, cols - 1)
+        left_panel_width = (
+            width if cols < MIN_COLS_FOR_SPLIT_PANE else max(MIN_LEFT_PANEL_WIDTH, (width // 2) - 1)
+        )
+        right_panel_col = left_panel_width + 2
+        right_panel_width = max(0, width - right_panel_col)
 
-        stdscr.addnstr(0, 0, title, width)
-        stdscr.addnstr(1, 0, help_text, width)
+        _add_line(stdscr, 0, 0, title, width)
+        _add_line(stdscr, 1, 0, UI_HELP_TEXT, width)
         stdscr.hline(2, 0, "-", width)
-        stdscr.addnstr(3, 0, status_snapshot, width)
+        _add_line(stdscr, 3, 0, status_snapshot, width)
         if error_snapshot:
-            stdscr.addnstr(4, 0, error_snapshot, width)
+            _add_line(stdscr, 4, 0, error_snapshot, width)
 
         list_header_row = 5 if error_snapshot else 4
-        stdscr.addnstr(list_header_row, 0, "Playlists:", width)
+        _add_line(stdscr, list_header_row, 0, "Playlists:", left_panel_width)
 
         if not playlists_snapshot:
-            stdscr.addnstr(list_header_row + 1, 0, "No playlists loaded yet.", width)
+            _add_line(stdscr, list_header_row + 1, 0, "No playlists loaded yet.", left_panel_width)
         else:
             max_visible = max(1, rows - (list_header_row + 2))
             start_index = max(0, selected_snapshot - max_visible + 1)
             visible = playlists_snapshot[start_index : start_index + max_visible]
-            for row_offset, (name, track_total) in enumerate(visible):
+            for row_offset, playlist in enumerate(visible):
                 playlist_index = start_index + row_offset
-                line = f"{playlist_index + 1}. {name} ({track_total} tracks)"
+                line = f"{playlist_index + 1}. {playlist.name} ({playlist.track_total} tracks)"
                 attr = curses.A_REVERSE if playlist_index == selected_snapshot else curses.A_NORMAL
-                stdscr.addnstr(list_header_row + 1 + row_offset, 0, line, width, attr)
+                _add_line(stdscr, list_header_row + 1 + row_offset, 0, line, left_panel_width, attr)
+
+        if right_panel_width > 0:
+            for row in range(3, rows):
+                _add_line(stdscr, row, left_panel_width + 1, "│", 1)
+            opened_playlist = _find_playlist_by_id(playlists_snapshot, opened_playlist_snapshot)
+            _add_line(stdscr, list_header_row, right_panel_col, "Songs:", right_panel_width)
+            if opened_playlist is None:
+                _add_line(
+                    stdscr,
+                    list_header_row + 1,
+                    right_panel_col,
+                    "Press Enter on a playlist to open songs.",
+                    right_panel_width,
+                )
+            else:
+                header = f"{opened_playlist.name} ({len(opened_playlist.tracks)} tracks)"
+                _add_line(stdscr, list_header_row + 1, right_panel_col, header, right_panel_width)
+                songs_row = list_header_row + 2
+                max_visible_songs = max(0, rows - songs_row)
+                for idx, track_name in enumerate(opened_playlist.tracks[:max_visible_songs]):
+                    _add_line(
+                        stdscr,
+                        songs_row + idx,
+                        right_panel_col,
+                        f"{idx + 1}. {track_name}",
+                        right_panel_width,
+                    )
 
         stdscr.refresh()
 
@@ -477,29 +718,37 @@ def run(stdscr: curses.window) -> None:
         if key == -1:
             continue
         if key in (ord("q"), ord("Q")):
+            stop_sync_event.set()
             break
         if key in (ord("c"), ord("C")):
             should_start_connection = False
             with connection_lock:
-                if connection_status == "running":
-                    status_message = "Connection already in progress..."
+                if state.connection_status == "connecting":
+                    state.status_message = "Connection already in progress..."
+                elif state.connection_status == "connected":
+                    state.status_message = "Already connected. Waiting for automatic sync updates."
                 else:
-                    status_message = "Connecting to Spotify..."
-                    error_message = ""
-                    connection_status = "running"
+                    state.status_message = "Connecting to Spotify..."
+                    state.error_message = ""
+                    state.connection_status = "connecting"
                     should_start_connection = True
             if should_start_connection:
                 threading.Thread(target=connect_worker, daemon=True).start()
             continue
         if key == curses.KEY_UP:
             with connection_lock:
-                if playlists:
-                    selected_index = max(0, selected_index - 1)
+                if state.playlists:
+                    state.selected_index = _clamp_index(state.selected_index - 1, len(state.playlists))
             continue
         if key == curses.KEY_DOWN:
             with connection_lock:
-                if playlists:
-                    selected_index = min(len(playlists) - 1, selected_index + 1)
+                if state.playlists:
+                    state.selected_index = _clamp_index(state.selected_index + 1, len(state.playlists))
+            continue
+        if key in ENTER_KEY_CODES:
+            with connection_lock:
+                if state.playlists:
+                    state.opened_playlist_id = state.playlists[state.selected_index].id
             continue
 
 

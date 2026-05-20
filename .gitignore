@@ -1,1 +1,3 @@
 clientid.sh
+__pycache__/
+*.pyc

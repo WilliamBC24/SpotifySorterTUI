@@ -16,6 +16,7 @@ python3 tui_input_demo.py
 
 ### Controls
 
-- `c`: connect/reload from Spotify (Authorization Code with PKCE)
+- `c`: connect to Spotify (only when disconnected)
 - `↑` / `↓`: move the highlighted playlist selection
+- `Enter`: open highlighted playlist songs in the right pane
 - `q`: quit the demo

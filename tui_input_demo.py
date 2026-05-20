@@ -39,6 +39,9 @@ DEFAULT_TRACK_NAME = "Unknown Track"
 UI_POLL_INTERVAL_MS = 100
 DEFAULT_SPOTIFY_SYNC_INTERVAL_SECONDS = 60
 UI_HELP_TEXT = "c: connect (disconnected only)  ↑/↓: move selection  Enter: open songs  q: quit"
+MIN_COLS_FOR_SPLIT_PANE = 70
+MIN_LEFT_PANEL_WIDTH = 24
+ENTER_KEY_CODES = (curses.KEY_ENTER, 10, 13)
 
 
 @dataclass(slots=True)
@@ -606,16 +609,23 @@ def run(stdscr: curses.window) -> None:
                 state.status_message = "Press c to retry Spotify connection."
 
     def sync_worker() -> None:
-        while not stop_sync_event.wait(timeout=sync_interval_seconds):
+        def update_sync_status(message: str) -> None:
             with connection_lock:
-                active_session = state.session
-                is_connected = state.connection_status == "connected" and active_session is not None
-                if is_connected:
-                    state.status_message = "Connected. Syncing Spotify updates..."
-            if not is_connected:
-                continue
+                if state.connection_status == "connected":
+                    state.status_message = message
+
+        while not stop_sync_event.wait(timeout=sync_interval_seconds):
             try:
-                refreshed_playlists = _sync_playlists(active_session)
+                with connection_lock:
+                    active_session = state.session
+                    is_connected = (
+                        state.connection_status == "connected" and active_session is not None
+                    )
+                    if is_connected:
+                        state.status_message = "Connected. Syncing Spotify updates..."
+                if not is_connected:
+                    continue
+                refreshed_playlists = _sync_playlists(active_session, status_callback=update_sync_status)
                 with connection_lock:
                     state.playlists = refreshed_playlists
                     state.selected_index = _clamp_index(state.selected_index, len(state.playlists))
@@ -625,13 +635,7 @@ def run(stdscr: curses.window) -> None:
                         state.opened_playlist_id = None
                     state.error_message = ""
                     state.status_message = f"Connected. Last synced at {time.strftime('%H:%M:%S')}."
-            except (
-                RuntimeError,
-                TimeoutError,
-                urllib.error.URLError,
-                json.JSONDecodeError,
-                UnicodeDecodeError,
-            ) as exc:
+            except Exception as exc:
                 with connection_lock:
                     state.session = None
                     state.connection_status = "disconnected"
@@ -653,7 +657,9 @@ def run(stdscr: curses.window) -> None:
 
         title = "Spotify Playlist Viewer TUI"
         width = max(1, cols - 1)
-        left_panel_width = width if cols < 70 else max(24, (width // 2) - 1)
+        left_panel_width = (
+            width if cols < MIN_COLS_FOR_SPLIT_PANE else max(MIN_LEFT_PANEL_WIDTH, (width // 2) - 1)
+        )
         right_panel_col = left_panel_width + 2
         right_panel_width = max(0, width - right_panel_col)
 
@@ -739,7 +745,7 @@ def run(stdscr: curses.window) -> None:
                 if state.playlists:
                     state.selected_index = _clamp_index(state.selected_index + 1, len(state.playlists))
             continue
-        if key in (curses.KEY_ENTER, 10, 13):
+        if key in ENTER_KEY_CODES:
             with connection_lock:
                 if state.playlists:
                     state.opened_playlist_id = state.playlists[state.selected_index].id

@@ -37,7 +37,8 @@ PKCE_VERIFIER_BYTES = 64
 DEFAULT_PLAYLIST_NAME = "Unnamed Playlist"
 DEFAULT_TRACK_NAME = "Unknown Track"
 UI_POLL_INTERVAL_MS = 100
-SPOTIFY_SYNC_INTERVAL_SECONDS = 20
+DEFAULT_SPOTIFY_SYNC_INTERVAL_SECONDS = 60
+UI_HELP_TEXT = "c: connect (disconnected only)  ↑/↓: move selection  Enter: open songs  q: quit"
 
 
 @dataclass(slots=True)
@@ -53,6 +54,17 @@ class PlaylistInfo:
 class SpotifySession:
     client_id: str
     token_cache: dict[str, object]
+
+
+@dataclass(slots=True)
+class UiState:
+    connection_status: str = "disconnected"
+    status_message: str = "Press c to connect to Spotify with PKCE."
+    error_message: str = ""
+    playlists: list[PlaylistInfo] = field(default_factory=list)
+    selected_index: int = 0
+    opened_playlist_id: str | None = None
+    session: SpotifySession | None = None
 
 
 def _base64_url_encode(data: bytes) -> str:
@@ -549,39 +561,37 @@ def run(stdscr: curses.window) -> None:
     stdscr.keypad(True)
 
     connection_lock = threading.Lock()
-    connection_status = "disconnected"
-    status_message = "Press c to connect to Spotify with PKCE."
-    error_message = ""
-    playlists: list[PlaylistInfo] = []
-    selected_index = 0
-    opened_playlist_id: str | None = None
-    session: SpotifySession | None = None
+    state = UiState()
     stop_sync_event = threading.Event()
+    sync_interval_seconds = max(
+        10,
+        _safe_int(
+            os.getenv("SPOTIFY_SYNC_INTERVAL_SECONDS", str(DEFAULT_SPOTIFY_SYNC_INTERVAL_SECONDS)),
+            DEFAULT_SPOTIFY_SYNC_INTERVAL_SECONDS,
+        ),
+    )
 
     def connect_worker() -> None:
-        nonlocal connection_status, status_message, error_message, playlists, selected_index, session
-
         def update_status(message: str) -> None:
-            nonlocal status_message
             with connection_lock:
-                status_message = message
+                state.status_message = message
 
         try:
             established_session, fetched_playlists = connect_and_get_session_playlists(
                 status_callback=update_status
             )
             with connection_lock:
-                session = established_session
-                playlists = fetched_playlists
-                selected_index = 0
-                error_message = ""
-                connection_status = "connected"
-                if playlists:
-                    status_message = (
-                        f"Connected. Synced {len(playlists)} playlist(s). Use up/down and Enter."
+                state.session = established_session
+                state.playlists = fetched_playlists
+                state.selected_index = 0
+                state.error_message = ""
+                state.connection_status = "connected"
+                if state.playlists:
+                    state.status_message = (
+                        f"Connected. Synced {len(state.playlists)} playlist(s). Use up/down and Enter."
                     )
                 else:
-                    status_message = "Connected. No playlists found for this user."
+                    state.status_message = "Connected. No playlists found for this user."
         except (
             RuntimeError,
             TimeoutError,
@@ -590,28 +600,31 @@ def run(stdscr: curses.window) -> None:
             UnicodeDecodeError,
         ) as exc:
             with connection_lock:
-                session = None
-                connection_status = "disconnected"
-                error_message = f"Connection failed: {exc}"
-                status_message = "Press c to retry Spotify connection."
+                state.session = None
+                state.connection_status = "disconnected"
+                state.error_message = f"Connection failed: {exc}"
+                state.status_message = "Press c to retry Spotify connection."
 
     def sync_worker() -> None:
-        nonlocal connection_status, status_message, error_message, playlists, selected_index, opened_playlist_id, session
-        while not stop_sync_event.wait(timeout=SPOTIFY_SYNC_INTERVAL_SECONDS):
+        while not stop_sync_event.wait(timeout=sync_interval_seconds):
             with connection_lock:
-                active_session = session
-                is_connected = connection_status == "connected" and active_session is not None
-            if not is_connected or active_session is None:
+                active_session = state.session
+                is_connected = state.connection_status == "connected" and active_session is not None
+                if is_connected:
+                    state.status_message = "Connected. Syncing Spotify updates..."
+            if not is_connected:
                 continue
             try:
                 refreshed_playlists = _sync_playlists(active_session)
                 with connection_lock:
-                    playlists = refreshed_playlists
-                    selected_index = _clamp_index(selected_index, len(playlists))
-                    if opened_playlist_id and not _find_playlist_by_id(playlists, opened_playlist_id):
-                        opened_playlist_id = None
-                    error_message = ""
-                    status_message = f"Connected. Last synced at {time.strftime('%H:%M:%S')}."
+                    state.playlists = refreshed_playlists
+                    state.selected_index = _clamp_index(state.selected_index, len(state.playlists))
+                    if state.opened_playlist_id and not _find_playlist_by_id(
+                        state.playlists, state.opened_playlist_id
+                    ):
+                        state.opened_playlist_id = None
+                    state.error_message = ""
+                    state.status_message = f"Connected. Last synced at {time.strftime('%H:%M:%S')}."
             except (
                 RuntimeError,
                 TimeoutError,
@@ -620,33 +633,32 @@ def run(stdscr: curses.window) -> None:
                 UnicodeDecodeError,
             ) as exc:
                 with connection_lock:
-                    session = None
-                    connection_status = "disconnected"
-                    error_message = f"Connection lost: {exc}"
-                    status_message = "Connection lost. Press c to reconnect."
+                    state.session = None
+                    state.connection_status = "disconnected"
+                    state.error_message = f"Connection lost: {exc}"
+                    state.status_message = "Connection lost. Press c to reconnect."
 
     threading.Thread(target=sync_worker, daemon=True).start()
 
     while True:
         with connection_lock:
-            status_snapshot = status_message
-            error_snapshot = error_message
-            playlists_snapshot = list(playlists)
-            selected_snapshot = selected_index
-            opened_playlist_snapshot = opened_playlist_id
+            status_snapshot = state.status_message
+            error_snapshot = state.error_message
+            playlists_snapshot = list(state.playlists)
+            selected_snapshot = state.selected_index
+            opened_playlist_snapshot = state.opened_playlist_id
 
         stdscr.erase()
         rows, cols = stdscr.getmaxyx()
 
         title = "Spotify Playlist Viewer TUI"
-        help_text = "c: connect (disconnected only)  ↑/↓: move selection  Enter: open songs  q: quit"
         width = max(1, cols - 1)
         left_panel_width = width if cols < 70 else max(24, (width // 2) - 1)
         right_panel_col = left_panel_width + 2
         right_panel_width = max(0, width - right_panel_col)
 
         _add_line(stdscr, 0, 0, title, width)
-        _add_line(stdscr, 1, 0, help_text, width)
+        _add_line(stdscr, 1, 0, UI_HELP_TEXT, width)
         stdscr.hline(2, 0, "-", width)
         _add_line(stdscr, 3, 0, status_snapshot, width)
         if error_snapshot:
@@ -705,32 +717,32 @@ def run(stdscr: curses.window) -> None:
         if key in (ord("c"), ord("C")):
             should_start_connection = False
             with connection_lock:
-                if connection_status == "connecting":
-                    status_message = "Connection already in progress..."
-                elif connection_status == "connected":
-                    status_message = "Already connected. Waiting for automatic sync updates."
+                if state.connection_status == "connecting":
+                    state.status_message = "Connection already in progress..."
+                elif state.connection_status == "connected":
+                    state.status_message = "Already connected. Waiting for automatic sync updates."
                 else:
-                    status_message = "Connecting to Spotify..."
-                    error_message = ""
-                    connection_status = "connecting"
+                    state.status_message = "Connecting to Spotify..."
+                    state.error_message = ""
+                    state.connection_status = "connecting"
                     should_start_connection = True
             if should_start_connection:
                 threading.Thread(target=connect_worker, daemon=True).start()
             continue
         if key == curses.KEY_UP:
             with connection_lock:
-                if playlists:
-                    selected_index = _clamp_index(selected_index - 1, len(playlists))
+                if state.playlists:
+                    state.selected_index = _clamp_index(state.selected_index - 1, len(state.playlists))
             continue
         if key == curses.KEY_DOWN:
             with connection_lock:
-                if playlists:
-                    selected_index = _clamp_index(selected_index + 1, len(playlists))
+                if state.playlists:
+                    state.selected_index = _clamp_index(state.selected_index + 1, len(state.playlists))
             continue
         if key in (curses.KEY_ENTER, 10, 13):
             with connection_lock:
-                if playlists:
-                    opened_playlist_id = playlists[selected_index].id
+                if state.playlists:
+                    state.opened_playlist_id = state.playlists[state.selected_index].id
             continue
 
 

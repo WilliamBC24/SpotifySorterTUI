@@ -36,7 +36,6 @@ INITIAL_BACKOFF_SECONDS = 1.0
 PKCE_VERIFIER_BYTES = 64
 DEFAULT_PLAYLIST_NAME = "Unnamed Playlist"
 DEFAULT_TRACK_NAME = "Unknown Track"
-FORBIDDEN_TRACKS_PLACEHOLDER = "Tracks unavailable (Spotify returned 403 Forbidden)."
 UI_POLL_INTERVAL_MS = 100
 DEFAULT_SPOTIFY_SYNC_INTERVAL_SECONDS = 60
 UI_HELP_TEXT = "c: connect (disconnected only)  ↑/↓: move selection  Enter: open songs  q: quit"
@@ -482,7 +481,7 @@ def _hydrate_playlist_tracks(
                 raise
             if status_callback is not None:
                 status_callback(f"Skipping playlist due to Spotify permissions (403): {playlist.name}")
-            tracks = [FORBIDDEN_TRACKS_PLACEHOLDER]
+            tracks = []
             updated_total = playlist.track_total
         hydrated.append(
             PlaylistInfo(

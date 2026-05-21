@@ -385,7 +385,7 @@ def _parse_track_item(item: object) -> str | None:
         if item.get("is_local") is True:
             return "Local file"
         return None
-    track_type = _safe_non_empty_string(track.get("type"), "track")
+    track_type = _safe_non_empty_string(track.get("type"), "")
     if track_type != "track":
         return None
     track_name = _safe_non_empty_string(track.get("name"), DEFAULT_TRACK_NAME)

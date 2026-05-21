@@ -383,7 +383,7 @@ def _parse_track_item(item: object) -> str | None:
         return None
     track = item.get("track")
     if not isinstance(track, dict):
-        if item.get("is_local") is True:
+        if item.get("is_local"):
             return DEFAULT_LOCAL_TRACK_NAME
         return None
     track_type = _safe_non_empty_string(track.get("type"), "")

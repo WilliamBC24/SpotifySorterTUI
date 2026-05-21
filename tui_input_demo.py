@@ -27,7 +27,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 SPOTIFY_AUTH_URL = "https://accounts.spotify.com/authorize"
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 SPOTIFY_PLAYLISTS_URL = "https://api.spotify.com/v1/me/playlists"
-SPOTIFY_PLAYLIST_FIELDS = "items(id,name,snapshot_id,tracks(total)),next,total"
+SPOTIFY_PLAYLIST_FIELDS = "items(id,name,snapshot_id,tracks(total),items(total)),next,total"
 SPOTIFY_PLAYLIST_TRACKS_FIELDS = "items(track(name,artists(name))),next,total"
 SPOTIFY_SCOPE = "playlist-read-private playlist-read-collaborative"
 SPOTIFY_MAX_RETRIES = 4
@@ -368,7 +368,9 @@ def _parse_playlist_item(item: object) -> PlaylistInfo | None:
         return None
     name = _safe_non_empty_string(item.get("name"), DEFAULT_PLAYLIST_NAME)
     snapshot_id = _safe_non_empty_string(item.get("snapshot_id"), "")
-    tracks_value = item.get("tracks", {})
+    tracks_value = item.get("tracks")
+    if not isinstance(tracks_value, dict):
+        tracks_value = item.get("items")
     track_total = 0
     if isinstance(tracks_value, dict):
         track_total = _safe_int(tracks_value.get("total"), 0)

@@ -37,6 +37,7 @@ INITIAL_BACKOFF_SECONDS = 1.0
 PKCE_VERIFIER_BYTES = 64
 DEFAULT_PLAYLIST_NAME = "Unnamed Playlist"
 DEFAULT_TRACK_NAME = "Unknown Track"
+DEFAULT_LOCAL_TRACK_NAME = "Local file"
 UI_POLL_INTERVAL_MS = 100
 DEFAULT_SPOTIFY_SYNC_INTERVAL_SECONDS = 60
 UI_HELP_TEXT = "c: connect (disconnected only)  ↑/↓: move selection  Enter: open songs  q: quit"
@@ -383,7 +384,7 @@ def _parse_track_item(item: object) -> str | None:
     track = item.get("track")
     if not isinstance(track, dict):
         if item.get("is_local") is True:
-            return "Local file"
+            return DEFAULT_LOCAL_TRACK_NAME
         return None
     track_type = _safe_non_empty_string(track.get("type"), "")
     if track_type != "track":

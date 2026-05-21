@@ -27,8 +27,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 SPOTIFY_AUTH_URL = "https://accounts.spotify.com/authorize"
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 SPOTIFY_PLAYLISTS_URL = "https://api.spotify.com/v1/me/playlists"
-SPOTIFY_PLAYLIST_FIELDS = "items(id,name,snapshot_id,tracks(total),items(total)),next,total"
-SPOTIFY_PLAYLIST_TRACKS_FIELDS = "items(track(name,artists(name))),next,total"
+SPOTIFY_PLAYLIST_FIELDS = "items(id,name,snapshot_id,tracks(total)),next,total"
+SPOTIFY_PLAYLIST_TRACKS_FIELDS = "items(track(name,artists(name),type),episode(name),is_local),next,total"
 SPOTIFY_SCOPE = "playlist-read-private playlist-read-collaborative"
 SPOTIFY_MAX_RETRIES = 4
 TOKEN_EXPIRY_BUFFER_SECONDS = 30
@@ -377,12 +377,17 @@ def _parse_playlist_item(item: object) -> PlaylistInfo | None:
     return PlaylistInfo(id=playlist_id, name=name, track_total=max(0, track_total), snapshot_id=snapshot_id)
 
 
-def _parse_track_item(item: object) -> str:
+def _parse_track_item(item: object) -> str | None:
     if not isinstance(item, dict):
-        return DEFAULT_TRACK_NAME
+        return None
     track = item.get("track")
     if not isinstance(track, dict):
-        return DEFAULT_TRACK_NAME
+        if item.get("is_local") is True:
+            return "Local file"
+        return None
+    track_type = _safe_non_empty_string(track.get("type"), "track")
+    if track_type != "track":
+        return None
     track_name = _safe_non_empty_string(track.get("name"), DEFAULT_TRACK_NAME)
     artists_raw = track.get("artists", [])
     artist_names: list[str] = []
@@ -408,6 +413,7 @@ def _fetch_playlist_tracks(
         {
             "limit": 100,
             "fields": SPOTIFY_PLAYLIST_TRACKS_FIELDS,
+            "additional_types": "track",
         }
     )
     quoted_playlist_id = urllib.parse.quote(playlist_id, safe="")
@@ -422,7 +428,9 @@ def _fetch_playlist_tracks(
         if not isinstance(items, list):
             items = []
         for item in items:
-            track_entries.append(_parse_track_item(item))
+            parsed_track = _parse_track_item(item)
+            if parsed_track is not None:
+                track_entries.append(parsed_track)
         raw_next = payload.get("next")
         next_url = raw_next if isinstance(raw_next, str) and raw_next else ""
     return track_entries

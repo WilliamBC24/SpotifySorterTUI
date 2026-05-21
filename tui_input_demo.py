@@ -426,7 +426,6 @@ def _fetch_user_playlists(
     query = urllib.parse.urlencode(
         {
             "limit": 50,
-            "fields": SPOTIFY_PLAYLIST_FIELDS,
         }
     )
     next_url = f"{SPOTIFY_PLAYLISTS_URL}?{query}"

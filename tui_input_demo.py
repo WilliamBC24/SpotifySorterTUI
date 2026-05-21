@@ -413,7 +413,6 @@ def _fetch_playlist_tracks(
         {
             "limit": 100,
             "fields": SPOTIFY_PLAYLIST_TRACKS_FIELDS,
-            "additional_types": "track",
         }
     )
     quoted_playlist_id = urllib.parse.quote(playlist_id, safe="")

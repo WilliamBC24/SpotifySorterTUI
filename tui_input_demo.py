@@ -52,6 +52,7 @@ class PlaylistInfo:
     track_total: int
     snapshot_id: str = ""
     tracks: list[str] = field(default_factory=list)
+    tracks_loaded: bool = False
 
 
 @dataclass(slots=True)
@@ -492,6 +493,7 @@ def _hydrate_playlist_tracks(
                 track_total=updated_total,
                 snapshot_id=playlist.snapshot_id,
                 tracks=tracks,
+                tracks_loaded=True,
             )
         )
     return hydrated
@@ -718,6 +720,7 @@ def run(stdscr: curses.window) -> None:
                         track_total=len(fetched_tracks),
                         snapshot_id=playlist.snapshot_id,
                         tracks=fetched_tracks,
+                        tracks_loaded=True,
                     )
                     break
                 state.error_message = ""
@@ -856,7 +859,7 @@ def run(stdscr: curses.window) -> None:
                     if (
                         state.connection_status == "connected"
                         and state.session is not None
-                        and not selected_playlist.tracks
+                        and not selected_playlist.tracks_loaded
                     ):
                         playlist_to_refresh = selected_playlist.id
                         state.status_message = (

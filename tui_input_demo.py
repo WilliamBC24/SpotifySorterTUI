@@ -36,6 +36,7 @@ INITIAL_BACKOFF_SECONDS = 1.0
 PKCE_VERIFIER_BYTES = 64
 DEFAULT_PLAYLIST_NAME = "Unnamed Playlist"
 DEFAULT_TRACK_NAME = "Unknown Track"
+FORBIDDEN_TRACKS_PLACEHOLDER = "Tracks unavailable (Spotify returned 403 Forbidden)."
 UI_POLL_INTERVAL_MS = 100
 DEFAULT_SPOTIFY_SYNC_INTERVAL_SECONDS = 60
 UI_HELP_TEXT = "c: connect (disconnected only)  ↑/↓: move selection  Enter: open songs  q: quit"
@@ -57,6 +58,13 @@ class PlaylistInfo:
 class SpotifySession:
     client_id: str
     token_cache: dict[str, object]
+
+
+class SpotifyApiError(RuntimeError):
+    def __init__(self, status_code: int, error_message: str) -> None:
+        super().__init__(f"Spotify API error {status_code}: {error_message}")
+        self.status_code = status_code
+        self.error_message = error_message
 
 
 @dataclass(slots=True)
@@ -275,7 +283,7 @@ def _spotify_request_json(
                 time.sleep(sleep_seconds)
                 backoff_seconds *= 2.0
                 continue
-            raise RuntimeError(f"Spotify API error {exc.code}: {error_message}") from exc
+            raise SpotifyApiError(exc.code, error_message) from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"Network error while contacting Spotify: {exc.reason}") from exc
 
@@ -466,8 +474,16 @@ def _hydrate_playlist_tracks(
     for index, playlist in enumerate(playlists, start=1):
         if status_callback is not None:
             status_callback(f"Fetching tracks for playlist {index}/{total}: {playlist.name}")
-        tracks = _fetch_playlist_tracks(client_id, token_cache, playlist.id)
-        updated_total = len(tracks)
+        try:
+            tracks = _fetch_playlist_tracks(client_id, token_cache, playlist.id)
+            updated_total = len(tracks)
+        except SpotifyApiError as exc:
+            if exc.status_code != 403:
+                raise
+            if status_callback is not None:
+                status_callback(f"Skipping playlist due to Spotify permissions (403): {playlist.name}")
+            tracks = [FORBIDDEN_TRACKS_PLACEHOLDER]
+            updated_total = playlist.track_total
         hydrated.append(
             PlaylistInfo(
                 id=playlist.id,

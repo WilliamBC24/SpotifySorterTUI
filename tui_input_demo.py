@@ -13,6 +13,7 @@ import secrets
 import shutil
 import subprocess
 import threading
+import textwrap
 import time
 import urllib.error
 import urllib.parse
@@ -51,6 +52,7 @@ class PlaylistInfo:
     track_total: int
     snapshot_id: str = ""
     tracks: list[str] = field(default_factory=list)
+    tracks_loaded: bool = False
 
 
 @dataclass(slots=True)
@@ -433,6 +435,7 @@ def _fetch_user_playlists(
     query = urllib.parse.urlencode(
         {
             "limit": 50,
+            "fields": SPOTIFY_PLAYLIST_FIELDS,
         }
     )
     next_url = f"{SPOTIFY_PLAYLISTS_URL}?{query}"
@@ -490,6 +493,7 @@ def _hydrate_playlist_tracks(
                 track_total=updated_total,
                 snapshot_id=playlist.snapshot_id,
                 tracks=tracks,
+                tracks_loaded=True,
             )
         )
     return hydrated
@@ -570,6 +574,45 @@ def _add_line(
     if row < 0 or row >= rows:
         return
     stdscr.addnstr(row, col, text, width, attr)
+
+
+def _wrap_text_lines(text: str, width: int) -> list[str]:
+    if width <= 0:
+        return []
+    lines: list[str] = []
+    for raw_line in text.splitlines() or [""]:
+        wrapped = textwrap.wrap(
+            raw_line,
+            width=width,
+            break_long_words=True,
+            break_on_hyphens=False,
+            replace_whitespace=False,
+            drop_whitespace=False,
+        )
+        lines.extend(wrapped or [""])
+    return lines
+
+
+def _add_wrapped_text(
+    stdscr: curses.window,
+    row: int,
+    col: int,
+    text: str,
+    width: int,
+    attr: int = curses.A_NORMAL,
+) -> int:
+    rows, _cols = stdscr.getmaxyx()
+    if width <= 0 or row >= rows:
+        return 0
+    lines = _wrap_text_lines(text, width)
+    drawn = 0
+    for line in lines:
+        draw_row = row + drawn
+        if draw_row >= rows:
+            break
+        _add_line(stdscr, draw_row, col, line, width, attr)
+        drawn += 1
+    return drawn
 
 
 def run(stdscr: curses.window) -> None:
@@ -656,6 +699,43 @@ def run(stdscr: curses.window) -> None:
                     state.error_message = f"Connection lost: {exc}"
                     state.status_message = "Connection lost. Press c to reconnect."
 
+    def load_playlist_tracks_worker(playlist_id: str) -> None:
+        with connection_lock:
+            active_session = state.session
+            if active_session is None or state.connection_status != "connected":
+                return
+        try:
+            fetched_tracks = _fetch_playlist_tracks(
+                active_session.client_id,
+                active_session.token_cache,
+                playlist_id,
+            )
+            with connection_lock:
+                for idx, playlist in enumerate(state.playlists):
+                    if playlist.id != playlist_id:
+                        continue
+                    state.playlists[idx] = PlaylistInfo(
+                        id=playlist.id,
+                        name=playlist.name,
+                        track_total=len(fetched_tracks),
+                        snapshot_id=playlist.snapshot_id,
+                        tracks=fetched_tracks,
+                        tracks_loaded=True,
+                    )
+                    break
+                state.error_message = ""
+                state.status_message = f"Loaded {len(fetched_tracks)} track(s) from selected playlist."
+        except (
+            RuntimeError,
+            TimeoutError,
+            urllib.error.URLError,
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+            SpotifyApiError,
+        ) as exc:
+            with connection_lock:
+                state.error_message = f"Unable to load selected playlist tracks: {exc}"
+
     threading.Thread(target=sync_worker, daemon=True).start()
 
     while True:
@@ -677,50 +757,61 @@ def run(stdscr: curses.window) -> None:
         right_panel_col = left_panel_width + 2
         right_panel_width = max(0, width - right_panel_col)
 
-        _add_line(stdscr, 0, 0, title, width)
-        _add_line(stdscr, 1, 0, UI_HELP_TEXT, width)
-        stdscr.hline(2, 0, "-", width)
-        _add_line(stdscr, 3, 0, status_snapshot, width)
+        content_row = 0
+        content_row += _add_wrapped_text(stdscr, content_row, 0, title, width)
+        content_row += _add_wrapped_text(stdscr, content_row, 0, UI_HELP_TEXT, width)
+        if content_row < rows:
+            stdscr.hline(content_row, 0, "-", width)
+        content_row += 1
+        content_row += _add_wrapped_text(stdscr, content_row, 0, status_snapshot, width)
         if error_snapshot:
-            _add_line(stdscr, 4, 0, error_snapshot, width)
+            content_row += _add_wrapped_text(stdscr, content_row, 0, error_snapshot, width)
 
-        list_header_row = 5 if error_snapshot else 4
-        _add_line(stdscr, list_header_row, 0, "Playlists:", left_panel_width)
+        list_header_row = content_row
+        playlist_header_lines = _add_wrapped_text(stdscr, list_header_row, 0, "Playlists:", left_panel_width)
+        left_list_start_row = list_header_row + max(1, playlist_header_lines)
 
         if not playlists_snapshot:
-            _add_line(stdscr, list_header_row + 1, 0, "No playlists loaded yet.", left_panel_width)
+            _add_wrapped_text(stdscr, left_list_start_row, 0, "No playlists loaded yet.", left_panel_width)
         else:
-            max_visible = max(1, rows - (list_header_row + 2))
+            max_visible = max(1, rows - (left_list_start_row + 1))
             start_index = max(0, selected_snapshot - max_visible + 1)
             visible = playlists_snapshot[start_index : start_index + max_visible]
+            left_draw_row = left_list_start_row
             for row_offset, playlist in enumerate(visible):
+                if left_draw_row >= rows:
+                    break
                 playlist_index = start_index + row_offset
                 line = f"{playlist_index + 1}. {playlist.name} ({playlist.track_total} tracks)"
                 attr = curses.A_REVERSE if playlist_index == selected_snapshot else curses.A_NORMAL
-                _add_line(stdscr, list_header_row + 1 + row_offset, 0, line, left_panel_width, attr)
+                left_draw_row += _add_wrapped_text(stdscr, left_draw_row, 0, line, left_panel_width, attr)
 
         if right_panel_width > 0:
-            for row in range(3, rows):
+            for row in range(list_header_row, rows):
                 _add_line(stdscr, row, left_panel_width + 1, "│", 1)
             opened_playlist = _find_playlist_by_id(playlists_snapshot, opened_playlist_snapshot)
-            _add_line(stdscr, list_header_row, right_panel_col, "Songs:", right_panel_width)
+            songs_header_lines = _add_wrapped_text(
+                stdscr, list_header_row, right_panel_col, "Songs:", right_panel_width
+            )
+            right_list_start_row = list_header_row + max(1, songs_header_lines)
             if opened_playlist is None:
                 _add_line(
                     stdscr,
-                    list_header_row + 1,
+                    right_list_start_row,
                     right_panel_col,
                     "Press Enter on a playlist to open songs.",
                     right_panel_width,
                 )
             else:
                 header = f"{opened_playlist.name} ({len(opened_playlist.tracks)} tracks)"
-                _add_line(stdscr, list_header_row + 1, right_panel_col, header, right_panel_width)
-                songs_row = list_header_row + 2
-                max_visible_songs = max(0, rows - songs_row)
-                for idx, track_name in enumerate(opened_playlist.tracks[:max_visible_songs]):
-                    _add_line(
+                songs_row = right_list_start_row
+                songs_row += _add_wrapped_text(stdscr, songs_row, right_panel_col, header, right_panel_width)
+                for idx, track_name in enumerate(opened_playlist.tracks):
+                    if songs_row >= rows:
+                        break
+                    songs_row += _add_wrapped_text(
                         stdscr,
-                        songs_row + idx,
+                        songs_row,
                         right_panel_col,
                         f"{idx + 1}. {track_name}",
                         right_panel_width,
@@ -760,9 +851,24 @@ def run(stdscr: curses.window) -> None:
                     state.selected_index = _clamp_index(state.selected_index + 1, len(state.playlists))
             continue
         if key in ENTER_KEY_CODES:
+            playlist_to_refresh: str | None = None
             with connection_lock:
                 if state.playlists:
-                    state.opened_playlist_id = state.playlists[state.selected_index].id
+                    selected_playlist = state.playlists[state.selected_index]
+                    state.opened_playlist_id = selected_playlist.id
+                    if (
+                        state.connection_status == "connected"
+                        and state.session is not None
+                        and not selected_playlist.tracks_loaded
+                    ):
+                        playlist_to_refresh = selected_playlist.id
+                        state.status_message = (
+                            f"Loading tracks for playlist: {selected_playlist.name}"
+                        )
+            if playlist_to_refresh is not None:
+                threading.Thread(
+                    target=load_playlist_tracks_worker, args=(playlist_to_refresh,), daemon=True
+                ).start()
             continue
 
 

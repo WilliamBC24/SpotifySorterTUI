@@ -8,6 +8,7 @@ import base64
 import datetime
 import hashlib
 import json
+import logging
 import os
 import secrets
 import shutil
@@ -29,7 +30,7 @@ SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 SPOTIFY_PLAYLISTS_URL = "https://api.spotify.com/v1/me/playlists"
 SPOTIFY_PLAYLIST_FIELDS = "items(id,name,snapshot_id,tracks(total),items(total)),next,total"
 SPOTIFY_PLAYLIST_TRACKS_FIELDS = "items(track(name,artists(name))),next,total"
-SPOTIFY_SCOPE = "playlist-read-private playlist-read-collaborative"
+SPOTIFY_SCOPE = "playlist-read-private playlist-read-collaborative user-library-read"
 SPOTIFY_MAX_RETRIES = 4
 TOKEN_EXPIRY_BUFFER_SECONDS = 30
 DEFAULT_TOKEN_EXPIRY_SECONDS = 3600
@@ -43,6 +44,19 @@ UI_HELP_TEXT = "c: connect (disconnected only)  ↑/↓: move selection  Enter: 
 MIN_COLS_FOR_SPLIT_PANE = 70
 MIN_LEFT_PANEL_WIDTH = 24
 ENTER_KEY_CODES = (curses.KEY_ENTER, 10, 13)
+
+# Configure logging to file
+logging.basicConfig(
+    filename="spotify_sorter.log",
+    level=logging.DEBUG,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    force=True,
+)
+# Get the logger and ensure handlers flush
+logger = logging.getLogger()
+for handler in logger.handlers:
+    handler.setLevel(logging.DEBUG)
 
 
 @dataclass(slots=True)
@@ -256,6 +270,8 @@ def _spotify_request_json(
     backoff_seconds = INITIAL_BACKOFF_SECONDS
     for attempt in range(max_retries + 1):
         request = urllib.request.Request(url, data=body, method=method, headers=request_headers)
+        logging.debug(f"Making {method} request to {url}")
+        logging.debug(f"Headers: {request_headers}")
         try:
             with urllib.request.urlopen(request, timeout=20) as response:
                 response_text = response.read().decode("utf-8")
@@ -266,6 +282,7 @@ def _spotify_request_json(
         except urllib.error.HTTPError as exc:
             error_body = exc.read()
             error_message = _read_error_message(error_body, exc.code)
+            logging.error(f"HTTP Error {exc.code} - Response body: {error_body.decode('utf-8', errors='ignore')}")
             if exc.code == 429 and attempt < max_retries:
                 retry_after_header = exc.headers.get("Retry-After", "").strip()
                 try:
@@ -337,7 +354,11 @@ def _refresh_access_token(client_id: str, refresh_token: str) -> dict[str, objec
     }
 
 
-def _get_access_token(client_id: str, token_cache: dict[str, object]) -> str:
+def _get_access_token(
+    client_id: str,
+    token_cache: dict[str, object],
+    force_refresh: bool = False,
+) -> str:
     access_token = token_cache.get("access_token")
     raw_expires_at = token_cache.get("expires_at", 0)
     if isinstance(raw_expires_at, (float, int)):
@@ -349,14 +370,22 @@ def _get_access_token(client_id: str, token_cache: dict[str, object]) -> str:
             expires_at = 0.0
     else:
         expires_at = 0.0
-    if isinstance(access_token, str) and access_token and time.time() < expires_at:
+    
+    current_time = time.time()
+    logging.debug(f"Token check - Current time: {current_time}, Expires at: {expires_at}, Token valid: {isinstance(access_token, str) and access_token and current_time < expires_at}")
+    
+    if not force_refresh and isinstance(access_token, str) and access_token and current_time < expires_at:
+        logging.debug("Using cached access token")
         return access_token
 
+    logging.debug("Access token expired or missing, attempting refresh")
     refresh_token = token_cache.get("refresh_token")
     if not isinstance(refresh_token, str) or not refresh_token:
         raise RuntimeError("Access token expired and no refresh token is available.")
+    logging.debug(f"Refreshing token with refresh_token: {refresh_token[:20]}...")
     refreshed = _refresh_access_token(client_id, refresh_token)
     token_cache.update(refreshed)
+    logging.debug(f"Token refreshed successfully")
     return str(token_cache["access_token"])
 
 
@@ -402,7 +431,9 @@ def _fetch_playlist_tracks(
     client_id: str,
     token_cache: dict[str, object],
     playlist_id: str,
+    force_refresh: bool = False,
 ) -> list[str]:
+    logging.debug('fetch play list track s')
     track_entries: list[str] = []
     query = urllib.parse.urlencode(
         {
@@ -412,19 +443,30 @@ def _fetch_playlist_tracks(
     )
     quoted_playlist_id = urllib.parse.quote(playlist_id, safe="")
     next_url = f"https://api.spotify.com/v1/playlists/{quoted_playlist_id}/tracks?{query}"
+    page_num = 0
     while next_url:
-        access_token = _get_access_token(client_id, token_cache)
+        page_num += 1
+        logging.debug(f"Fetching page {page_num} from: {next_url}")
+        access_token = _get_access_token(client_id, token_cache, force_refresh=force_refresh)
         payload = _spotify_request_json(
             next_url,
             headers={"Authorization": f"Bearer {access_token}"},
         )
+        logging.debug(f"Payload keys: {list(payload.keys())}")
+        logging.debug(f"Spotify playlist tracks response: {json.dumps(payload, indent=2)}")
+        logging.getLogger().handlers[0].flush() if logging.getLogger().handlers else None
         items = payload.get("items", [])
+        logging.debug(f"Items count: {len(items) if isinstance(items, list) else 'not a list'}")
         if not isinstance(items, list):
             items = []
         for item in items:
-            track_entries.append(_parse_track_item(item))
+            parsed_track = _parse_track_item(item)
+            logging.debug(f"Parsed track: {parsed_track}")
+            track_entries.append(parsed_track)
         raw_next = payload.get("next")
         next_url = raw_next if isinstance(raw_next, str) and raw_next else ""
+        logging.debug(f"Has next page: {bool(next_url)}")
+    logging.debug(f"Total tracks fetched: {len(track_entries)}")
     return track_entries
 
 
@@ -473,6 +515,7 @@ def _hydrate_playlist_tracks(
     playlists: list[PlaylistInfo],
     status_callback: Callable[[str], None] | None = None,
 ) -> list[PlaylistInfo]:
+    logging.debug('hydrate playlist track')
     hydrated: list[PlaylistInfo] = []
     total = len(playlists)
     for index, playlist in enumerate(playlists, start=1):
@@ -702,7 +745,9 @@ def run(stdscr: curses.window) -> None:
                     state.status_message = "Connection lost. Press c to reconnect."
 
     def load_playlist_tracks_worker(playlist_id: str) -> None:
+        logging.debug('load playlist track worker')
         with connection_lock:
+            logging.debug('got lock')
             active_session = state.session
             if active_session is None or state.connection_status != "connected":
                 return
@@ -711,11 +756,19 @@ def run(stdscr: curses.window) -> None:
                 active_session.client_id,
                 active_session.token_cache,
                 playlist_id,
+                force_refresh=True,
             )
+            logging.debug('fetched track')
+            logging.debug(f"Fetched tracks list: {fetched_tracks}")
+            logging.debug(f"Number of fetched tracks: {len(fetched_tracks)}")
             with connection_lock:
+                logging.debug(f"Looking for playlist with id: {playlist_id}")
+                found = False
                 for idx, playlist in enumerate(state.playlists):
                     if playlist.id != playlist_id:
                         continue
+                    logging.debug(f"Found playlist at index {idx}: {playlist.name}")
+                    found = True
                     state.playlists[idx] = PlaylistInfo(
                         id=playlist.id,
                         name=playlist.name,
@@ -724,7 +777,10 @@ def run(stdscr: curses.window) -> None:
                         tracks=fetched_tracks,
                         tracks_loaded=True,
                     )
+                    logging.debug(f"Updated playlist with {len(fetched_tracks)} tracks")
                     break
+                if not found:
+                    logging.debug(f"ERROR: Playlist with id {playlist_id} not found!")
                 state.error_message = ""
                 state.status_message = f"Loaded {len(fetched_tracks)} track(s) from selected playlist."
         except (
@@ -735,6 +791,9 @@ def run(stdscr: curses.window) -> None:
             UnicodeDecodeError,
             SpotifyApiError,
         ) as exc:
+            logging.error(f"Exception caught in load_playlist_tracks_worker: {type(exc).__name__}: {exc}")
+            if isinstance(exc, SpotifyApiError):
+                logging.error(f"Spotify API Error - Status: {exc.status_code}, Message: {exc.error_message}")
             with connection_lock:
                 state.error_message = f"Unable to load selected playlist tracks: {exc}"
 
@@ -806,6 +865,9 @@ def run(stdscr: curses.window) -> None:
                 )
             else:
                 header = f"{opened_playlist.name} ({len(opened_playlist.tracks)} tracks)"
+                logging.debug(f"Displaying opened playlist: {opened_playlist.name}")
+                logging.debug(f"Opened playlist tracks: {opened_playlist.tracks}")
+                logging.debug(f"Number of tracks to display: {len(opened_playlist.tracks)}")
                 songs_row = right_list_start_row
                 songs_row += _add_wrapped_text(stdscr, songs_row, right_panel_col, header, right_panel_width)
                 for idx, track_name in enumerate(opened_playlist.tracks):
@@ -854,19 +916,28 @@ def run(stdscr: curses.window) -> None:
             continue
         if key in ENTER_KEY_CODES:
             playlist_to_refresh: str | None = None
+            logging.debug(playlist_to_refresh)
             with connection_lock:
+                logging.debug('got lock after enter')
                 if state.playlists:
                     selected_playlist = state.playlists[state.selected_index]
+                    logging.debug(f"Selected playlist: {selected_playlist.name}")
+                    logging.debug(f"Connection status: {state.connection_status}")
+                    logging.debug(f"Session exists: {state.session is not None}")
+                    logging.debug(f"Tracks loaded: {selected_playlist.tracks_loaded}")
                     state.opened_playlist_id = selected_playlist.id
                     if (
                         state.connection_status == "connected"
                         and state.session is not None
-                        and not selected_playlist.tracks_loaded
+                        # and not selected_playlist.tracks_loaded
                     ):
                         playlist_to_refresh = selected_playlist.id
+                        logging.debug(f"Setting playlist_to_refresh to: {playlist_to_refresh}")
                         state.status_message = (
                             f"Loading tracks for playlist: {selected_playlist.name}"
                         )
+                    else:
+                        logging.debug("Condition failed - tracks already loaded or not connected")
             if playlist_to_refresh is not None:
                 threading.Thread(
                     target=load_playlist_tracks_worker, args=(playlist_to_refresh,), daemon=True

@@ -277,7 +277,7 @@ def _spotify_request_json(
     body: bytes | None = None
     request_headers = dict(headers or {})
     if form_body is not None and json_body is not None:
-        raise ValueError("Cannot provide both form_body and json_body parameters.")
+        raise ValueError("Cannot provide both form_body and json_body to the same request.")
     if form_body is not None:
         body = urllib.parse.urlencode(form_body).encode("utf-8")
         request_headers["Content-Type"] = "application/x-www-form-urlencoded"
@@ -709,8 +709,8 @@ def _create_playlist(
     playlist_info = _parse_playlist_item(payload)
     if playlist_info is None:
         raise RuntimeError(
-            "Failed to retrieve playlist details after creation. "
-            "Please try again or check your connection."
+            "Failed to parse playlist details from Spotify's response after creation. "
+            "The API may have returned unexpected data."
         )
     return playlist_info
 
@@ -1008,7 +1008,7 @@ def run(stdscr: curses.window) -> None:
 
             if not resolved_destination_playlist_id:
                 raise RuntimeError(
-                    "No destination playlist specified. This is likely a bug in the application logic."
+                    "Could not determine destination playlist. Please try selecting a playlist again."
                 )
 
             _add_track_to_playlist(
@@ -1311,8 +1311,8 @@ def run(stdscr: curses.window) -> None:
                         track_to_move = opened_playlist.tracks[track_index]
                         if not track_to_move.uri:
                             state.error_message = (
-                                "Selected song cannot be moved because Spotify URI is missing. "
-                                "This may be a syncing issue. Try refreshing the playlist or reconnecting to Spotify."
+                                "Selected song cannot be moved because track information is incomplete. "
+                                "Try reconnecting to Spotify."
                             )
                         else:
                             option_count = len(state.playlists) + 1
@@ -1334,7 +1334,9 @@ def run(stdscr: curses.window) -> None:
                                     continue
                                 requested_name = state.new_playlist_name.strip()
                                 if not requested_name:
-                                    state.error_message = "Playlist name cannot be empty."
+                                    state.error_message = (
+                                        "Playlist name cannot be empty. Please enter a name to create the playlist."
+                                    )
                                     continue
                                 new_playlist_name = requested_name
                             else:

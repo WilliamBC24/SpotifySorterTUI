@@ -994,6 +994,7 @@ def run(stdscr: curses.window) -> None:
         try:
             resolved_destination_playlist_id = destination_playlist_id
             created_playlist_name = ""
+            current_user_id = ""
             if resolved_destination_playlist_id is None:
                 current_user_id = _fetch_current_user_id(active_session.client_id, active_session.token_cache)
                 created_playlist = _create_playlist(
@@ -1024,7 +1025,10 @@ def run(stdscr: curses.window) -> None:
                 source_track_position,
             )
 
-            current_user_id = _fetch_current_user_id(active_session.client_id, active_session.token_cache)
+            if not current_user_id:
+                current_user_id = _fetch_current_user_id(
+                    active_session.client_id, active_session.token_cache
+                )
             refreshed_playlists = _sync_playlists(active_session, current_user_id)
 
             with connection_lock:
@@ -1306,7 +1310,10 @@ def run(stdscr: curses.window) -> None:
                         track_index = _clamp_index(state.tracks_selected_index, len(opened_playlist.tracks))
                         track_to_move = opened_playlist.tracks[track_index]
                         if not track_to_move.uri:
-                            state.error_message = "Selected song cannot be moved because Spotify URI is missing."
+                            state.error_message = (
+                                "Selected song cannot be moved because Spotify URI is missing. "
+                                "This may be a syncing issue. Try refreshing the playlist or reconnecting to Spotify."
+                            )
                         else:
                             option_count = len(state.playlists) + 1
                             state.target_selected_index = _clamp_index(
@@ -1333,7 +1340,9 @@ def run(stdscr: curses.window) -> None:
                             else:
                                 target_playlist = state.playlists[state.target_selected_index]
                                 if target_playlist.id == opened_playlist.id:
-                                    state.error_message = "Source and destination playlists are the same."
+                                    state.error_message = (
+                                        "Cannot move song to the same playlist it's already in."
+                                    )
                                     continue
                                 destination_playlist_id = target_playlist.id
                                 restore_target_playlist_id = target_playlist.id

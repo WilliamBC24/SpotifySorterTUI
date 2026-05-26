@@ -928,7 +928,7 @@ def run(stdscr: curses.window) -> None:
                     if (
                         state.connection_status == "connected"
                         and state.session is not None
-                        # and not selected_playlist.tracks_loaded
+                        and not selected_playlist.tracks_loaded
                     ):
                         playlist_to_refresh = selected_playlist.id
                         logging.debug(f"Setting playlist_to_refresh to: {playlist_to_refresh}")
@@ -936,7 +936,7 @@ def run(stdscr: curses.window) -> None:
                             f"Loading tracks for playlist: {selected_playlist.name}"
                         )
                     else:
-                        logging.debug("Condition failed - tracks already loaded or not connected")
+                        logging.debug("Condition failed - tracks already loaded/skipped or not connected")
             if playlist_to_refresh is not None:
                 threading.Thread(
                     target=load_playlist_tracks_worker, args=(playlist_to_refresh,), daemon=True

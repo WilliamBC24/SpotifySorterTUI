@@ -756,7 +756,6 @@ def run(stdscr: curses.window) -> None:
                 active_session.client_id,
                 active_session.token_cache,
                 playlist_id,
-                force_refresh=True,
             )
             logging.debug('fetched track')
             logging.debug(f"Fetched tracks list: {fetched_tracks}")

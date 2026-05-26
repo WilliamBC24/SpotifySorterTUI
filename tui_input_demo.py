@@ -277,7 +277,7 @@ def _spotify_request_json(
     body: bytes | None = None
     request_headers = dict(headers or {})
     if form_body is not None and json_body is not None:
-        raise ValueError("Only one of form_body or json_body can be provided.")
+        raise ValueError("Cannot provide both form_body and json_body parameters.")
     if form_body is not None:
         body = urllib.parse.urlencode(form_body).encode("utf-8")
         request_headers["Content-Type"] = "application/x-www-form-urlencoded"
@@ -708,7 +708,10 @@ def _create_playlist(
     )
     playlist_info = _parse_playlist_item(payload)
     if playlist_info is None:
-        raise RuntimeError("Spotify did not return playlist details after playlist creation.")
+        raise RuntimeError(
+            "Failed to retrieve playlist details after creation. "
+            "Please try again or check your connection."
+        )
     return playlist_info
 
 
@@ -1003,7 +1006,9 @@ def run(stdscr: curses.window) -> None:
                 created_playlist_name = created_playlist.name
 
             if not resolved_destination_playlist_id:
-                raise RuntimeError("No destination playlist selected.")
+                raise RuntimeError(
+                    "No destination playlist specified. This is likely a bug in the application logic."
+                )
 
             _add_track_to_playlist(
                 active_session.client_id,

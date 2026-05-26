@@ -43,10 +43,14 @@ DEFAULT_PLAYLIST_NAME = "Unnamed Playlist"
 DEFAULT_TRACK_NAME = "Unknown Track"
 UI_POLL_INTERVAL_MS = 100
 DEFAULT_SPOTIFY_SYNC_INTERVAL_SECONDS = 60
-UI_HELP_TEXT = "c: connect (disconnected only)  ↑/↓: move selection  Enter: open songs  q: quit"
+UI_HELP_TEXT = (
+    "c: connect (disconnected only)  ↑/↓: move in focused pane  "
+    "→: open/focus songs  ←: back to playlists  q: quit"
+)
 MIN_COLS_FOR_SPLIT_PANE = 70
 MIN_LEFT_PANEL_WIDTH = 24
-ENTER_KEY_CODES = (curses.KEY_ENTER, 10, 13)
+PANEL_PLAYLISTS = "playlists"
+PANEL_TRACKS = "tracks"
 
 
 @dataclass(slots=True)
@@ -81,6 +85,8 @@ class UiState:
     playlists: list[PlaylistInfo] = field(default_factory=list)
     selected_index: int = 0
     opened_playlist_id: str | None = None
+    focused_panel: str = PANEL_PLAYLISTS
+    tracks_selected_index: int = 0
     session: SpotifySession | None = None
 
 
@@ -734,7 +740,7 @@ def run(stdscr: curses.window) -> None:
                 state.connection_status = "connected"
                 if state.playlists:
                     state.status_message = (
-                        f"Connected. Synced {len(state.playlists)} playlist(s). Use up/down and Enter."
+                        f"Connected. Synced {len(state.playlists)} playlist(s). Use up/down and →."
                     )
                 else:
                     state.status_message = "Connected. No playlists found for this user."
@@ -789,10 +795,15 @@ def run(stdscr: curses.window) -> None:
                 with connection_lock:
                     state.playlists = refreshed_playlists
                     state.selected_index = _clamp_index(state.selected_index, len(state.playlists))
-                    if state.opened_playlist_id and not _find_playlist_by_id(
-                        state.playlists, state.opened_playlist_id
-                    ):
+                    opened_playlist = _find_playlist_by_id(state.playlists, state.opened_playlist_id)
+                    if opened_playlist is None:
                         state.opened_playlist_id = None
+                        state.focused_panel = PANEL_PLAYLISTS
+                        state.tracks_selected_index = 0
+                    else:
+                        state.tracks_selected_index = _clamp_index(
+                            state.tracks_selected_index, len(opened_playlist.tracks)
+                        )
                     state.error_message = ""
                     state.status_message = f"Connected. Last synced at {time.strftime('%H:%M:%S')}."
             except Exception as exc:
@@ -845,6 +856,8 @@ def run(stdscr: curses.window) -> None:
                     state.selected_index = _clamp_index(state.selected_index, len(state.playlists))
                     if state.opened_playlist_id == playlist_id:
                         state.opened_playlist_id = None
+                        state.focused_panel = PANEL_PLAYLISTS
+                        state.tracks_selected_index = 0
                     state.error_message = ""
                     state.status_message = "Hidden playlist that Spotify does not allow this app to read."
                 else:
@@ -859,6 +872,8 @@ def run(stdscr: curses.window) -> None:
             playlists_snapshot = list(state.playlists)
             selected_snapshot = state.selected_index
             opened_playlist_snapshot = state.opened_playlist_id
+            focused_panel_snapshot = state.focused_panel
+            tracks_selected_snapshot = state.tracks_selected_index
 
         stdscr.erase()
         rows, cols = stdscr.getmaxyx()
@@ -897,7 +912,13 @@ def run(stdscr: curses.window) -> None:
                     break
                 playlist_index = start_index + row_offset
                 line = f"{playlist_index + 1}. {playlist.name} ({playlist.track_total} tracks)"
-                attr = curses.A_REVERSE if playlist_index == selected_snapshot else curses.A_NORMAL
+                is_selected = playlist_index == selected_snapshot
+                if is_selected and focused_panel_snapshot == PANEL_PLAYLISTS:
+                    attr = curses.A_REVERSE
+                elif is_selected:
+                    attr = curses.A_BOLD
+                else:
+                    attr = curses.A_NORMAL
                 left_draw_row += _add_wrapped_text(stdscr, left_draw_row, 0, line, left_panel_width, attr)
 
         if right_panel_width > 0:
@@ -913,23 +934,44 @@ def run(stdscr: curses.window) -> None:
                     stdscr,
                     right_list_start_row,
                     right_panel_col,
-                    "Press Enter on a playlist to open songs.",
+                    "Press → on a playlist to open songs.",
                     right_panel_width,
                 )
             else:
                 header = f"{opened_playlist.name} ({len(opened_playlist.tracks)} tracks)"
                 songs_row = right_list_start_row
                 songs_row += _add_wrapped_text(stdscr, songs_row, right_panel_col, header, right_panel_width)
-                for idx, track_name in enumerate(opened_playlist.tracks):
-                    if songs_row >= rows:
-                        break
-                    songs_row += _add_wrapped_text(
-                        stdscr,
-                        songs_row,
-                        right_panel_col,
-                        f"{idx + 1}. {track_name}",
-                        right_panel_width,
-                    )
+                if songs_row < rows:
+                    if not opened_playlist.tracks:
+                        _add_line(
+                            stdscr,
+                            songs_row,
+                            right_panel_col,
+                            "No tracks found in this playlist.",
+                            right_panel_width,
+                        )
+                    else:
+                        max_visible_tracks = max(1, rows - songs_row)
+                        tracks_start_index = max(
+                            0, tracks_selected_snapshot - max_visible_tracks + 1
+                        )
+                        visible_tracks = opened_playlist.tracks[
+                            tracks_start_index : tracks_start_index + max_visible_tracks
+                        ]
+                        for row_offset, track_name in enumerate(visible_tracks):
+                            draw_row = songs_row + row_offset
+                            if draw_row >= rows:
+                                break
+                            track_index = tracks_start_index + row_offset
+                            line = f"{track_index + 1}. {track_name}"
+                            is_selected = track_index == tracks_selected_snapshot
+                            if is_selected and focused_panel_snapshot == PANEL_TRACKS:
+                                attr = curses.A_REVERSE
+                            elif is_selected:
+                                attr = curses.A_BOLD
+                            else:
+                                attr = curses.A_NORMAL
+                            _add_line(stdscr, draw_row, right_panel_col, line, right_panel_width, attr)
 
         stdscr.refresh()
 
@@ -956,20 +998,38 @@ def run(stdscr: curses.window) -> None:
             continue
         if key == curses.KEY_UP:
             with connection_lock:
-                if state.playlists:
+                if state.focused_panel == PANEL_PLAYLISTS and state.playlists:
                     state.selected_index = _clamp_index(state.selected_index - 1, len(state.playlists))
+                elif state.focused_panel == PANEL_TRACKS:
+                    opened_playlist = _find_playlist_by_id(state.playlists, state.opened_playlist_id)
+                    if opened_playlist is not None:
+                        state.tracks_selected_index = _clamp_index(
+                            state.tracks_selected_index - 1, len(opened_playlist.tracks)
+                        )
             continue
         if key == curses.KEY_DOWN:
             with connection_lock:
-                if state.playlists:
+                if state.focused_panel == PANEL_PLAYLISTS and state.playlists:
                     state.selected_index = _clamp_index(state.selected_index + 1, len(state.playlists))
+                elif state.focused_panel == PANEL_TRACKS:
+                    opened_playlist = _find_playlist_by_id(state.playlists, state.opened_playlist_id)
+                    if opened_playlist is not None:
+                        state.tracks_selected_index = _clamp_index(
+                            state.tracks_selected_index + 1, len(opened_playlist.tracks)
+                        )
             continue
-        if key in ENTER_KEY_CODES:
+        if key == curses.KEY_RIGHT:
             playlist_to_refresh: str | None = None
             with connection_lock:
                 if state.playlists:
                     selected_playlist = state.playlists[state.selected_index]
+                    if state.opened_playlist_id != selected_playlist.id:
+                        state.tracks_selected_index = 0
                     state.opened_playlist_id = selected_playlist.id
+                    state.focused_panel = PANEL_TRACKS
+                    state.tracks_selected_index = _clamp_index(
+                        state.tracks_selected_index, len(selected_playlist.tracks)
+                    )
                     if (
                         state.connection_status == "connected"
                         and state.session is not None
@@ -983,6 +1043,10 @@ def run(stdscr: curses.window) -> None:
                 threading.Thread(
                     target=load_playlist_tracks_worker, args=(playlist_to_refresh,), daemon=True
                 ).start()
+            continue
+        if key == curses.KEY_LEFT:
+            with connection_lock:
+                state.focused_panel = PANEL_PLAYLISTS
             continue
 
 

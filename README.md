@@ -19,6 +19,8 @@ python3 tui_input_demo.py
 
 - `c`: connect to Spotify (only when disconnected)
 - `↑` / `↓`: move selection in the currently focused pane
-- `→`: open the highlighted playlist and move focus to the songs pane
-- `←`: move focus back to the playlists pane
+- `→`: playlists → songs, then songs → move-target pane
+- `←`: move focus back one pane (move-target → songs → playlists)
+- `Enter` (move-target pane only): move selected song to selected playlist
+- `+ Create new playlist` (in move-target pane): press `Enter`, type name, `Enter` again to create and move
 - `q`: quit the demo

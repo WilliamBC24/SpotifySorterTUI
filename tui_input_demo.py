@@ -28,12 +28,16 @@ SPOTIFY_AUTH_URL = "https://accounts.spotify.com/authorize"
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 SPOTIFY_PLAYLISTS_URL = "https://api.spotify.com/v1/me/playlists"
 SPOTIFY_PLAYLIST_FIELDS = "items(id,name,snapshot_id,owner(id),tracks(total),items(total)),next,total"
-SPOTIFY_PLAYLIST_ITEMS_FIELDS = "items(item(name,artists(name))),next,total"
-SPOTIFY_PLAYLIST_TRACKS_FIELDS = "items(track(name,artists(name))),next,total"
+SPOTIFY_PLAYLIST_ITEMS_FIELDS = "items(item(name,uri,artists(name))),next,total"
+SPOTIFY_PLAYLIST_TRACKS_FIELDS = "items(track(name,uri,artists(name))),next,total"
 SPOTIFY_PLAYLIST_TRACKS_LIMIT = 50
 SPOTIFY_PLAYLIST_TRACKS_URL_TEMPLATE = "https://api.spotify.com/v1/playlists/{playlist_id}/tracks"
 SPOTIFY_PLAYLIST_ITEMS_URL_TEMPLATE = "https://api.spotify.com/v1/playlists/{playlist_id}/items"
-SPOTIFY_SCOPE = "playlist-read-private playlist-read-collaborative user-library-read user-read-private user-read-email"
+SPOTIFY_USER_PLAYLISTS_URL_TEMPLATE = "https://api.spotify.com/v1/users/{user_id}/playlists"
+SPOTIFY_SCOPE = (
+    "playlist-read-private playlist-read-collaborative playlist-modify-private "
+    "playlist-modify-public user-library-read user-read-private user-read-email"
+)
 SPOTIFY_MAX_RETRIES = 4
 TOKEN_EXPIRY_BUFFER_SECONDS = 30
 DEFAULT_TOKEN_EXPIRY_SECONDS = 3600
@@ -45,12 +49,20 @@ UI_POLL_INTERVAL_MS = 100
 DEFAULT_SPOTIFY_SYNC_INTERVAL_SECONDS = 60
 UI_HELP_TEXT = (
     "c: connect (disconnected only)  ↑/↓: move in focused pane  "
-    "→: open/focus songs  ←: back to playlists  q: quit"
+    "→: open/focus next pane  ←: previous pane  Enter: action in move pane  q: quit"
 )
 MIN_COLS_FOR_SPLIT_PANE = 70
 MIN_LEFT_PANEL_WIDTH = 24
 PANEL_PLAYLISTS = "playlists"
 PANEL_TRACKS = "tracks"
+PANEL_TARGETS = "targets"
+CREATE_PLAYLIST_OPTION_LABEL = "+ Create new playlist"
+
+
+@dataclass(slots=True)
+class TrackInfo:
+    display: str
+    uri: str = ""
 
 
 @dataclass(slots=True)
@@ -60,7 +72,7 @@ class PlaylistInfo:
     track_total: int
     snapshot_id: str = ""
     owner_id: str = ""
-    tracks: list[str] = field(default_factory=list)
+    tracks: list[TrackInfo] = field(default_factory=list)
     tracks_loaded: bool = False
 
 
@@ -87,6 +99,9 @@ class UiState:
     opened_playlist_id: str | None = None
     focused_panel: str = PANEL_PLAYLISTS
     tracks_selected_index: int = 0
+    target_selected_index: int = 0
+    creating_playlist: bool = False
+    new_playlist_name: str = ""
     session: SpotifySession | None = None
 
 
@@ -256,13 +271,19 @@ def _spotify_request_json(
     method: str = "GET",
     headers: dict[str, str] | None = None,
     form_body: dict[str, str] | None = None,
+    json_body: dict[str, object] | list[object] | None = None,
     max_retries: int = SPOTIFY_MAX_RETRIES,
 ) -> dict[str, object]:
     body: bytes | None = None
     request_headers = dict(headers or {})
+    if form_body is not None and json_body is not None:
+        raise ValueError("Cannot provide both form_body and json_body to the same request.")
     if form_body is not None:
         body = urllib.parse.urlencode(form_body).encode("utf-8")
         request_headers["Content-Type"] = "application/x-www-form-urlencoded"
+    elif json_body is not None:
+        body = json.dumps(json_body).encode("utf-8")
+        request_headers["Content-Type"] = "application/json"
 
     backoff_seconds = INITIAL_BACKOFF_SECONDS
     for attempt in range(max_retries + 1):
@@ -416,15 +437,16 @@ def _fetch_current_user_id(
     return _safe_non_empty_string(payload.get("id"), "")
 
 
-def _parse_track_item(item: object) -> str:
+def _parse_track_item(item: object) -> TrackInfo:
     if not isinstance(item, dict):
-        return DEFAULT_TRACK_NAME
+        return TrackInfo(display=DEFAULT_TRACK_NAME)
     track = item.get("item")
     if not isinstance(track, dict):
         track = item.get("track")
     if not isinstance(track, dict):
-        return DEFAULT_TRACK_NAME
+        return TrackInfo(display=DEFAULT_TRACK_NAME)
     track_name = _safe_non_empty_string(track.get("name"), DEFAULT_TRACK_NAME)
+    track_uri = _safe_non_empty_string(track.get("uri"), "")
     artists_raw = track.get("artists", [])
     artist_names: list[str] = []
     if isinstance(artists_raw, list):
@@ -435,8 +457,8 @@ def _parse_track_item(item: object) -> str:
             if artist_name:
                 artist_names.append(artist_name)
     if not artist_names:
-        return track_name
-    return f"{track_name} — {', '.join(artist_names)}"
+        return TrackInfo(display=track_name, uri=track_uri)
+    return TrackInfo(display=f"{track_name} — {', '.join(artist_names)}", uri=track_uri)
 
 
 def _fetch_playlist_tracks_page(
@@ -447,8 +469,8 @@ def _fetch_playlist_tracks_page(
     endpoint_url_template: str,
     fields: str,
     force_refresh: bool = False,
-) -> list[str]:
-    track_entries: list[str] = []
+) -> list[TrackInfo]:
+    track_entries: list[TrackInfo] = []
     query = urllib.parse.urlencode(
         {
             "limit": SPOTIFY_PLAYLIST_TRACKS_LIMIT,
@@ -482,7 +504,7 @@ def _fetch_playlist_tracks(
     token_cache: dict[str, object],
     playlist_id: str,
     force_refresh: bool = False,
-) -> list[str]:
+) -> list[TrackInfo]:
     try:
         return _fetch_playlist_tracks_page(
             client_id,
@@ -652,6 +674,80 @@ def _find_playlist_by_id(playlists: list[PlaylistInfo], playlist_id: str | None)
     return None
 
 
+def _find_playlist_index_by_id(playlists: list[PlaylistInfo], playlist_id: str | None) -> int | None:
+    if not playlist_id:
+        return None
+    for idx, playlist in enumerate(playlists):
+        if playlist.id == playlist_id:
+            return idx
+    return None
+
+
+def _find_track_index_by_uri(tracks: list[TrackInfo], track_uri: str) -> int | None:
+    if not track_uri:
+        return None
+    for idx, track in enumerate(tracks):
+        if track.uri == track_uri:
+            return idx
+    return None
+
+
+def _create_playlist(
+    client_id: str,
+    token_cache: dict[str, object],
+    user_id: str,
+    playlist_name: str,
+) -> PlaylistInfo:
+    access_token = _get_access_token(client_id, token_cache)
+    quoted_user_id = urllib.parse.quote(user_id, safe="")
+    payload = _spotify_request_json(
+        SPOTIFY_USER_PLAYLISTS_URL_TEMPLATE.format(user_id=quoted_user_id),
+        method="POST",
+        headers={"Authorization": f"Bearer {access_token}"},
+        json_body={"name": playlist_name, "public": False},
+    )
+    playlist_info = _parse_playlist_item(payload)
+    if playlist_info is None:
+        raise RuntimeError(
+            "Failed to parse playlist details from Spotify's response after creation. "
+            "The API may have returned unexpected data."
+        )
+    return playlist_info
+
+
+def _add_track_to_playlist(
+    client_id: str,
+    token_cache: dict[str, object],
+    playlist_id: str,
+    track_uri: str,
+) -> None:
+    access_token = _get_access_token(client_id, token_cache)
+    quoted_playlist_id = urllib.parse.quote(playlist_id, safe="")
+    _spotify_request_json(
+        SPOTIFY_PLAYLIST_TRACKS_URL_TEMPLATE.format(playlist_id=quoted_playlist_id),
+        method="POST",
+        headers={"Authorization": f"Bearer {access_token}"},
+        json_body={"uris": [track_uri]},
+    )
+
+
+def _remove_track_from_playlist(
+    client_id: str,
+    token_cache: dict[str, object],
+    playlist_id: str,
+    track_uri: str,
+    track_position: int,
+) -> None:
+    access_token = _get_access_token(client_id, token_cache)
+    quoted_playlist_id = urllib.parse.quote(playlist_id, safe="")
+    _spotify_request_json(
+        SPOTIFY_PLAYLIST_TRACKS_URL_TEMPLATE.format(playlist_id=quoted_playlist_id),
+        method="DELETE",
+        headers={"Authorization": f"Bearer {access_token}"},
+        json_body={"tracks": [{"uri": track_uri, "positions": [track_position]}]},
+    )
+
+
 def _add_line(
     stdscr: curses.window,
     row: int,
@@ -736,6 +832,12 @@ def run(stdscr: curses.window) -> None:
                 state.session = established_session
                 state.playlists = fetched_playlists
                 state.selected_index = 0
+                state.opened_playlist_id = None
+                state.focused_panel = PANEL_PLAYLISTS
+                state.tracks_selected_index = 0
+                state.target_selected_index = 0
+                state.creating_playlist = False
+                state.new_playlist_name = ""
                 state.error_message = ""
                 state.connection_status = "connected"
                 if state.playlists:
@@ -804,6 +906,11 @@ def run(stdscr: curses.window) -> None:
                         state.tracks_selected_index = _clamp_index(
                             state.tracks_selected_index, len(opened_playlist.tracks)
                         )
+                    option_count = len(state.playlists) + 1
+                    state.target_selected_index = _clamp_index(state.target_selected_index, option_count)
+                    if state.creating_playlist and state.target_selected_index != len(state.playlists):
+                        state.creating_playlist = False
+                        state.new_playlist_name = ""
                     state.error_message = ""
                     state.status_message = f"Connected. Last synced at {time.strftime('%H:%M:%S')}."
             except Exception as exc:
@@ -858,10 +965,127 @@ def run(stdscr: curses.window) -> None:
                         state.opened_playlist_id = None
                         state.focused_panel = PANEL_PLAYLISTS
                         state.tracks_selected_index = 0
+                        state.target_selected_index = 0
+                        state.creating_playlist = False
+                        state.new_playlist_name = ""
                     state.error_message = ""
                     state.status_message = "Hidden playlist that Spotify does not allow this app to read."
                 else:
                     state.error_message = f"Unable to load selected playlist tracks: {exc}"
+
+    def move_track_worker(
+        source_playlist_id: str,
+        source_track_uri: str,
+        source_track_position: int,
+        destination_playlist_id: str | None,
+        new_playlist_name: str | None,
+        selected_playlist_id: str | None,
+        opened_playlist_id: str | None,
+        previous_tracks_selected_index: int,
+        restore_target_playlist_id: str | None,
+    ) -> None:
+        with connection_lock:
+            active_session = state.session
+            is_connected = state.connection_status == "connected" and active_session is not None
+        if not is_connected:
+            with connection_lock:
+                state.error_message = "Not connected. Press c to connect before moving songs."
+            return
+        try:
+            resolved_destination_playlist_id = destination_playlist_id
+            created_playlist_name = ""
+            current_user_id = ""
+            if resolved_destination_playlist_id is None:
+                current_user_id = _fetch_current_user_id(active_session.client_id, active_session.token_cache)
+                created_playlist = _create_playlist(
+                    active_session.client_id,
+                    active_session.token_cache,
+                    current_user_id,
+                    str(new_playlist_name),
+                )
+                resolved_destination_playlist_id = created_playlist.id
+                created_playlist_name = created_playlist.name
+
+            if not resolved_destination_playlist_id:
+                raise RuntimeError(
+                    "Could not determine destination playlist. Please try selecting a playlist again."
+                )
+
+            _add_track_to_playlist(
+                active_session.client_id,
+                active_session.token_cache,
+                resolved_destination_playlist_id,
+                source_track_uri,
+            )
+            _remove_track_from_playlist(
+                active_session.client_id,
+                active_session.token_cache,
+                source_playlist_id,
+                source_track_uri,
+                source_track_position,
+            )
+
+            if not current_user_id:
+                current_user_id = _fetch_current_user_id(
+                    active_session.client_id, active_session.token_cache
+                )
+            refreshed_playlists = _sync_playlists(active_session, current_user_id)
+
+            with connection_lock:
+                state.playlists = refreshed_playlists
+
+                restored_left_index = _find_playlist_index_by_id(state.playlists, selected_playlist_id)
+                if restored_left_index is None:
+                    state.selected_index = _clamp_index(state.selected_index, len(state.playlists))
+                else:
+                    state.selected_index = restored_left_index
+
+                restored_opened = _find_playlist_by_id(state.playlists, opened_playlist_id)
+                if restored_opened is None:
+                    state.opened_playlist_id = None
+                    state.tracks_selected_index = 0
+                    state.focused_panel = PANEL_PLAYLISTS
+                else:
+                    state.opened_playlist_id = restored_opened.id
+                    restored_track_index = _find_track_index_by_uri(
+                        restored_opened.tracks, source_track_uri
+                    )
+                    if restored_track_index is None:
+                        state.tracks_selected_index = _clamp_index(
+                            previous_tracks_selected_index, len(restored_opened.tracks)
+                        )
+                    else:
+                        state.tracks_selected_index = restored_track_index
+
+                target_playlist_to_restore = restore_target_playlist_id or resolved_destination_playlist_id
+                restored_target_index = _find_playlist_index_by_id(
+                    state.playlists, target_playlist_to_restore
+                )
+                option_count = len(state.playlists) + 1
+                if restored_target_index is None:
+                    state.target_selected_index = _clamp_index(state.target_selected_index, option_count)
+                else:
+                    state.target_selected_index = restored_target_index
+                state.creating_playlist = False
+                state.new_playlist_name = ""
+
+                if created_playlist_name:
+                    state.status_message = (
+                        f"Created playlist '{created_playlist_name}' and moved selected song."
+                    )
+                else:
+                    state.status_message = "Moved selected song."
+                state.error_message = ""
+        except (
+            RuntimeError,
+            TimeoutError,
+            urllib.error.URLError,
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+            SpotifyApiError,
+        ) as exc:
+            with connection_lock:
+                state.error_message = f"Could not move selected song: {exc}"
 
     threading.Thread(target=sync_worker, daemon=True).start()
 
@@ -874,6 +1098,9 @@ def run(stdscr: curses.window) -> None:
             opened_playlist_snapshot = state.opened_playlist_id
             focused_panel_snapshot = state.focused_panel
             tracks_selected_snapshot = state.tracks_selected_index
+            target_selected_snapshot = state.target_selected_index
+            creating_playlist_snapshot = state.creating_playlist
+            new_playlist_name_snapshot = state.new_playlist_name
 
         stdscr.erase()
         rows, cols = stdscr.getmaxyx()
@@ -885,6 +1112,14 @@ def run(stdscr: curses.window) -> None:
         )
         right_panel_col = left_panel_width + 2
         right_panel_width = max(0, width - right_panel_col)
+        songs_panel_col = right_panel_col
+        songs_panel_width = right_panel_width
+        targets_panel_col = right_panel_col
+        targets_panel_width = 0
+        if right_panel_width >= (MIN_LEFT_PANEL_WIDTH * 2) + 1:
+            songs_panel_width = max(MIN_LEFT_PANEL_WIDTH, (right_panel_width // 2) - 1)
+            targets_panel_col = songs_panel_col + songs_panel_width + 1
+            targets_panel_width = max(0, right_panel_width - songs_panel_width - 1)
 
         content_row = 0
         content_row += _add_wrapped_text(stdscr, content_row, 0, title, width)
@@ -924,31 +1159,34 @@ def run(stdscr: curses.window) -> None:
         if right_panel_width > 0:
             for row in range(list_header_row, rows):
                 _add_line(stdscr, row, left_panel_width + 1, "│", 1)
+            if targets_panel_width > 0:
+                for row in range(list_header_row, rows):
+                    _add_line(stdscr, row, targets_panel_col - 1, "│", 1)
             opened_playlist = _find_playlist_by_id(playlists_snapshot, opened_playlist_snapshot)
             songs_header_lines = _add_wrapped_text(
-                stdscr, list_header_row, right_panel_col, "Songs:", right_panel_width
+                stdscr, list_header_row, songs_panel_col, "Songs:", songs_panel_width
             )
             right_list_start_row = list_header_row + max(1, songs_header_lines)
             if opened_playlist is None:
                 _add_line(
                     stdscr,
                     right_list_start_row,
-                    right_panel_col,
+                    songs_panel_col,
                     "Press → on a playlist to open songs.",
-                    right_panel_width,
+                    songs_panel_width,
                 )
             else:
                 header = f"{opened_playlist.name} ({len(opened_playlist.tracks)} tracks)"
                 songs_row = right_list_start_row
-                songs_row += _add_wrapped_text(stdscr, songs_row, right_panel_col, header, right_panel_width)
+                songs_row += _add_wrapped_text(stdscr, songs_row, songs_panel_col, header, songs_panel_width)
                 if songs_row < rows:
                     if not opened_playlist.tracks:
                         _add_line(
                             stdscr,
                             songs_row,
-                            right_panel_col,
+                            songs_panel_col,
                             "No tracks found in this playlist.",
-                            right_panel_width,
+                            songs_panel_width,
                         )
                     else:
                         max_visible_tracks = max(1, rows - songs_row)
@@ -963,7 +1201,7 @@ def run(stdscr: curses.window) -> None:
                             if draw_row >= rows:
                                 break
                             track_index = tracks_start_index + row_offset
-                            line = f"{track_index + 1}. {track_name}"
+                            line = f"{track_index + 1}. {track_name.display}"
                             is_selected = track_index == tracks_selected_snapshot
                             if is_selected and focused_panel_snapshot == PANEL_TRACKS:
                                 attr = curses.A_REVERSE
@@ -971,7 +1209,62 @@ def run(stdscr: curses.window) -> None:
                                 attr = curses.A_BOLD
                             else:
                                 attr = curses.A_NORMAL
-                            _add_line(stdscr, draw_row, right_panel_col, line, right_panel_width, attr)
+                            _add_line(stdscr, draw_row, songs_panel_col, line, songs_panel_width, attr)
+
+            if targets_panel_width > 0:
+                targets_header_lines = _add_wrapped_text(
+                    stdscr, list_header_row, targets_panel_col, "Move to:", targets_panel_width
+                )
+                targets_list_start_row = list_header_row + max(1, targets_header_lines)
+                if opened_playlist is None:
+                    _add_line(
+                        stdscr,
+                        targets_list_start_row,
+                        targets_panel_col,
+                        "Open a song first with →.",
+                        targets_panel_width,
+                    )
+                elif not opened_playlist.tracks:
+                    _add_line(
+                        stdscr,
+                        targets_list_start_row,
+                        targets_panel_col,
+                        "No songs to move.",
+                        targets_panel_width,
+                    )
+                else:
+                    option_count = len(playlists_snapshot) + 1
+                    selected_target = _clamp_index(target_selected_snapshot, option_count)
+                    max_visible_targets = max(1, rows - targets_list_start_row)
+                    targets_start_index = max(0, selected_target - max_visible_targets + 1)
+                    draw_row = targets_list_start_row
+                    for option_index in range(
+                        targets_start_index,
+                        min(option_count, targets_start_index + max_visible_targets),
+                    ):
+                        if draw_row >= rows:
+                            break
+                        if option_index < len(playlists_snapshot):
+                            playlist = playlists_snapshot[option_index]
+                            line = f"{option_index + 1}. {playlist.name} ({playlist.track_total} tracks)"
+                        else:
+                            if creating_playlist_snapshot and option_index == selected_target:
+                                line = (
+                                    f"New playlist: {new_playlist_name_snapshot}"
+                                    if new_playlist_name_snapshot
+                                    else "New playlist: "
+                                )
+                            else:
+                                line = CREATE_PLAYLIST_OPTION_LABEL
+                        is_selected = option_index == selected_target
+                        if is_selected and focused_panel_snapshot == PANEL_TARGETS:
+                            attr = curses.A_REVERSE
+                        elif is_selected:
+                            attr = curses.A_BOLD
+                        else:
+                            attr = curses.A_NORMAL
+                        _add_line(stdscr, draw_row, targets_panel_col, line, targets_panel_width, attr)
+                        draw_row += 1
 
         stdscr.refresh()
 
@@ -996,6 +1289,105 @@ def run(stdscr: curses.window) -> None:
             if should_start_connection:
                 threading.Thread(target=connect_worker, daemon=True).start()
             continue
+        if key in (curses.KEY_ENTER, 10, 13):
+            move_args: tuple[
+                str,
+                str,
+                int,
+                str | None,
+                str | None,
+                str | None,
+                str | None,
+                int,
+                str | None,
+            ] | None = None
+            with connection_lock:
+                if state.focused_panel == PANEL_TARGETS:
+                    opened_playlist = _find_playlist_by_id(state.playlists, state.opened_playlist_id)
+                    if opened_playlist is None or not opened_playlist.tracks:
+                        state.error_message = "Select a song first before choosing move target."
+                    else:
+                        track_index = _clamp_index(state.tracks_selected_index, len(opened_playlist.tracks))
+                        track_to_move = opened_playlist.tracks[track_index]
+                        if not track_to_move.uri:
+                            state.error_message = (
+                                "Selected song cannot be moved because track information is incomplete. "
+                                "Try reconnecting to Spotify."
+                            )
+                        else:
+                            option_count = len(state.playlists) + 1
+                            state.target_selected_index = _clamp_index(
+                                state.target_selected_index, option_count
+                            )
+                            create_option_index = len(state.playlists)
+                            destination_playlist_id: str | None = None
+                            new_playlist_name: str | None = None
+                            restore_target_playlist_id: str | None = None
+                            if state.target_selected_index == create_option_index:
+                                if not state.creating_playlist:
+                                    state.creating_playlist = True
+                                    state.new_playlist_name = ""
+                                    state.error_message = ""
+                                    state.status_message = (
+                                        "Type new playlist name and press Enter to create it and move selected song."
+                                    )
+                                    continue
+                                requested_name = state.new_playlist_name.strip()
+                                if not requested_name:
+                                    state.error_message = (
+                                        "Playlist name cannot be empty. Please enter a name to create the playlist."
+                                    )
+                                    continue
+                                new_playlist_name = requested_name
+                            else:
+                                target_playlist = state.playlists[state.target_selected_index]
+                                if target_playlist.id == opened_playlist.id:
+                                    state.error_message = (
+                                        "Cannot move song to the same playlist it's already in."
+                                    )
+                                    continue
+                                destination_playlist_id = target_playlist.id
+                                restore_target_playlist_id = target_playlist.id
+                                state.creating_playlist = False
+                                state.new_playlist_name = ""
+
+                            selected_playlist_id = None
+                            if state.playlists:
+                                selected_playlist_id = state.playlists[state.selected_index].id
+                            move_args = (
+                                opened_playlist.id,
+                                track_to_move.uri,
+                                track_index,
+                                destination_playlist_id,
+                                new_playlist_name,
+                                selected_playlist_id,
+                                state.opened_playlist_id,
+                                state.tracks_selected_index,
+                                restore_target_playlist_id,
+                            )
+                            state.error_message = ""
+                            state.status_message = "Moving selected song..."
+            if move_args is not None:
+                threading.Thread(target=move_track_worker, args=move_args, daemon=True).start()
+            continue
+        if key == 27:
+            with connection_lock:
+                if state.focused_panel == PANEL_TARGETS and state.creating_playlist:
+                    state.creating_playlist = False
+                    state.new_playlist_name = ""
+                    state.status_message = "Canceled new playlist creation."
+                    state.error_message = ""
+                    continue
+        if key in (curses.KEY_BACKSPACE, 127, 8):
+            with connection_lock:
+                if state.focused_panel == PANEL_TARGETS and state.creating_playlist:
+                    state.new_playlist_name = state.new_playlist_name[:-1]
+                    continue
+        if 32 <= key <= 126:
+            with connection_lock:
+                if state.focused_panel == PANEL_TARGETS and state.creating_playlist:
+                    state.new_playlist_name += chr(key)
+                    continue
         if key == curses.KEY_UP:
             with connection_lock:
                 if state.focused_panel == PANEL_PLAYLISTS and state.playlists:
@@ -1006,6 +1398,14 @@ def run(stdscr: curses.window) -> None:
                         state.tracks_selected_index = _clamp_index(
                             state.tracks_selected_index - 1, len(opened_playlist.tracks)
                         )
+                elif state.focused_panel == PANEL_TARGETS:
+                    option_count = len(state.playlists) + 1
+                    state.target_selected_index = _clamp_index(
+                        state.target_selected_index - 1, option_count
+                    )
+                    if state.creating_playlist and state.target_selected_index != len(state.playlists):
+                        state.creating_playlist = False
+                        state.new_playlist_name = ""
             continue
         if key == curses.KEY_DOWN:
             with connection_lock:
@@ -1017,11 +1417,19 @@ def run(stdscr: curses.window) -> None:
                         state.tracks_selected_index = _clamp_index(
                             state.tracks_selected_index + 1, len(opened_playlist.tracks)
                         )
+                elif state.focused_panel == PANEL_TARGETS:
+                    option_count = len(state.playlists) + 1
+                    state.target_selected_index = _clamp_index(
+                        state.target_selected_index + 1, option_count
+                    )
+                    if state.creating_playlist and state.target_selected_index != len(state.playlists):
+                        state.creating_playlist = False
+                        state.new_playlist_name = ""
             continue
         if key == curses.KEY_RIGHT:
             playlist_to_refresh: str | None = None
             with connection_lock:
-                if state.playlists:
+                if state.focused_panel == PANEL_PLAYLISTS and state.playlists:
                     selected_playlist = state.playlists[state.selected_index]
                     if state.opened_playlist_id != selected_playlist.id:
                         state.tracks_selected_index = 0
@@ -1039,6 +1447,16 @@ def run(stdscr: curses.window) -> None:
                         state.status_message = (
                             f"Loading tracks for playlist: {selected_playlist.name}"
                         )
+                elif state.focused_panel == PANEL_TRACKS:
+                    opened_playlist = _find_playlist_by_id(state.playlists, state.opened_playlist_id)
+                    if opened_playlist is None or not opened_playlist.tracks:
+                        state.status_message = "Open a playlist with songs before choosing a destination."
+                    else:
+                        state.focused_panel = PANEL_TARGETS
+                        option_count = len(state.playlists) + 1
+                        state.target_selected_index = _clamp_index(
+                            state.target_selected_index, option_count
+                        )
             if playlist_to_refresh is not None:
                 threading.Thread(
                     target=load_playlist_tracks_worker, args=(playlist_to_refresh,), daemon=True
@@ -1046,7 +1464,12 @@ def run(stdscr: curses.window) -> None:
             continue
         if key == curses.KEY_LEFT:
             with connection_lock:
-                state.focused_panel = PANEL_PLAYLISTS
+                if state.focused_panel == PANEL_TARGETS:
+                    state.focused_panel = PANEL_TRACKS
+                    state.creating_playlist = False
+                    state.new_playlist_name = ""
+                elif state.focused_panel == PANEL_TRACKS:
+                    state.focused_panel = PANEL_PLAYLISTS
             continue
 
 
